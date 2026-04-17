@@ -146,6 +146,11 @@ _CHITCHAT_WORKING_DAY = re.compile(
     r"|\b(saturday|sunday|sat|sun|today|tomorrow|tmr|tmrw)\b.*\bworking\s*day\b",
     re.IGNORECASE,
 )
+_CHITCHAT_DAY_STATEMENT = re.compile(
+    r"\b(today|tomorrow|tmr|tmrw)\b\s+\b(is|=)\b\s+"
+    r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b",
+    re.IGNORECASE,
+)
 
 _DEPARTMENT_MISMATCH = re.compile(
     r"\b(all\s+departments?|entire\s+college|all\s+branches?|whole\s+college|every\s+department)\b",
@@ -419,6 +424,7 @@ def classify(
         or _CHITCHAT_ACK.match(q)
         or _CHITCHAT_FEATURES.search(ql)
         or _CHITCHAT_WORKING_DAY.search(ql)
+        or _CHITCHAT_DAY_STATEMENT.search(ql)
     ):
         return {"intent": Intent.CHITCHAT, "question": q, "day": None, "pending": None}
 
