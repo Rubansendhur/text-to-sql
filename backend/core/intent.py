@@ -530,7 +530,7 @@ def chitchat_reply(question: str, department_code: Optional[str]) -> str:
             "- Ask AI for natural-language queries over your department data\n\n"
             "You can also rate AI responses with 👍/👎 to help improve future results."
         )
-    if _CHITCHAT_WORKING_DAY.search(ql):
+    if _CHITCHAT_WORKING_DAY.search(ql) or _CHITCHAT_DAY_STATEMENT.search(ql):
         day = _extract_day_code(question)
         if day == "Sun":
             return (
