@@ -183,7 +183,9 @@ def resolve_relative_days(question: str) -> str:
     Resolve relative day words to concrete weekday names using system date.
     e.g. "... today" -> "... on Monday", "... tomorrow" -> "... on Tuesday"
     """
-    if not (_TODAY_WORDS.search(question) or _TOMORROW_WORDS.search(question)):
+    has_relative = bool(_TODAY_WORDS.search(question) or _TOMORROW_WORDS.search(question))
+    has_explicit_date = bool(_DATE_DMY.search(question) or _DATE_MDY.search(question))
+    if not (has_relative or has_explicit_date):
         return question
     # don't substitute if an explicit day already appears
     if _DAY_PATTERN.search(question):
