@@ -915,6 +915,29 @@ def expand_followup_question(question: str, history_msgs: list[dict]) -> str:
         if hour:
             return f"Which staff will be free on {hour}th hour?"
 
+    # ── Date-only follow-up: "on 22nd?" (inherit month/hour from previous) ──
+    dom_match = re.search(r"\b(?:on\s+)?([0-3]?\d)(?:st|nd|rd|th)\b", q, flags=re.IGNORECASE)
+    if dom_match:
+        # Capture month token from previous explicit-date question (e.g., "21st arpil").
+        month_match = re.search(
+            r"\b(?:[0-3]?\d(?:st|nd|rd|th)?\s*(?:of\s+)?([A-Za-z]{3,10})|([A-Za-z]{3,10})\s*[0-3]?\d(?:st|nd|rd|th)?)\b",
+            previous_q,
+            flags=re.IGNORECASE,
+        )
+        month_token = (month_match.group(1) or month_match.group(2)).strip() if month_match else None
+        prev_hour = extract_hour_token(previous_q)
+        day_num = int(dom_match.group(1))
+
+        if month_token and prev_is_free_staff:
+            if prev_hour is not None:
+                return f"Which staff will be free on {day_num} {month_token} {prev_hour}th hour?"
+            return f"Which staff will be free on {day_num} {month_token}?"
+
+        if month_token and re.search(r"\b(?:timetable|schedule)\b", previous_q, flags=re.IGNORECASE):
+            if prev_hour is not None:
+                return f"Show timetable on {day_num} {month_token} {prev_hour}th hour"
+            return f"Show timetable on {day_num} {month_token}"
+
     # ── Name-swap: "for kannamal?" / "same for manju" ────────────────────────
     target_match = re.search(
         r"(?:same\s+for|also\s+for|for|same\b)\s*([A-Za-z\.\s]{2,80})",

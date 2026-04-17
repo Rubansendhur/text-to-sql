@@ -259,9 +259,13 @@ async def chat(
     store   = get_session_store()
     session = store.get_or_create(user_id, session_id, dept)
 
+    # Expand short follow-ups using recent session context BEFORE intent classify
+    # so terse prompts like "on 22nd?" can inherit prior question context.
+    expanded_for_intent = _expand_with_session(raw_question, session)
+
     # ── Intent classification ─────────────────────────────────────────────────
     classified = classify(
-        raw_question,
+        expanded_for_intent,
         session.pending_clarification,
         department_code=dept,
         is_central_admin=is_admin,
@@ -341,9 +345,9 @@ async def chat(
         session_store=store
     )
 
-    # Expand short follow-ups using recent session context
-    semantic_q = _expand_with_session(question, session)
-    is_followup = semantic_q.lower() != question.lower().strip()
+    # Question is already session-expanded before classification.
+    semantic_q = question
+    is_followup = expanded_for_intent.lower().strip() != raw_question.lower().strip()
 
     result = await agent.handle_data_query(
         user_id=user_id,
