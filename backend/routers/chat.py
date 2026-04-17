@@ -345,6 +345,26 @@ async def chat(
 
     # ── User replied with a day ───────────────────────────────────────────────
     if intent == Intent.CLARIFY_REPLY:
+        if classified.get("day") == "Sun":
+            reply = (
+                "Got it. Sunday is treated as a non-working day in this timetable setup, "
+                "so there are no class/free-slot records to show. "
+                "Tell me a working day (Monday to Saturday) and I will fetch it."
+            )
+            session.pending_clarification = None
+            session.add_turn(Turn(role="assistant", content=reply, intent=intent))
+            message_id = await _save_history(
+                user_id=user_id, session_id=session_id, question=raw_question,
+                sql=None, response=reply, result_count=0,
+                model_used="chat-intent", confidence="high", execution_ms=0,
+                error=None, department_code=dept, intent=intent,
+            )
+            return _text_response(
+                session_id,
+                raw_question,
+                reply,
+                message_id=message_id if message_id > 0 else None,
+            )
         session.pending_clarification = None
 
     # ── DATA_QUERY ────────────────────────────────────────────────────────────
