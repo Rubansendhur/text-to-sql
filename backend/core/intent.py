@@ -39,7 +39,7 @@ _DAY_MAP = {
 }
 
 _TODAY_WORDS = re.compile(r"\btoday(?:'s|s)?\b", re.IGNORECASE)
-_TOMORROW_WORDS = re.compile(r"\btomorrow(?:'s|s)?\b", re.IGNORECASE)
+_TOMORROW_WORDS = re.compile(r"\b(?:tomorrow|tommorow|tommorow|tomoorow|tmrw|tmr)(?:'s|s)?\b", re.IGNORECASE)
 _DAY_PATTERN = re.compile(
     r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday"
     r"|tuesady|teusday|wednesady|wednsday|wensday|thrusday|thurday|satuday"
@@ -49,6 +49,24 @@ _DAY_PATTERN = re.compile(
 _TIMETABLE_WORDS = re.compile(
     r"\b(timetable|schedule|class(?:es)?|period|slot|hour)\b", re.IGNORECASE
 )
+
+_MONTH_TO_NUM = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
+_MONTH_ALT = r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+_DATE_DMY = re.compile(rf"\b([0-3]?\d)\s*(?:st|nd|rd|th)?\s*(?:of\s+)?({_MONTH_ALT})\b", re.IGNORECASE)
+_DATE_MDY = re.compile(rf"\b({_MONTH_ALT})\s*([0-3]?\d)\s*(?:st|nd|rd|th)?\b", re.IGNORECASE)
 
 _DATA_CUES = re.compile(
     r"\b(show|list|get|fetch|find|how many|count|which|who|what|students?|faculty|arrear|subject|"
@@ -181,6 +199,38 @@ def resolve_relative_days(question: str) -> str:
     full = full_names[day]
     text = _TODAY_WORDS.sub(f"on {full}", question)
     text = _TOMORROW_WORDS.sub(f"on {full}", text)
+
+    # Resolve explicit date mentions like "18th Apr" or "Apr 18th" using system year.
+    # If an explicit weekday is already present, we leave the question unchanged.
+    if _DAY_PATTERN.search(text):
+        return text
+
+    def _weekday_for(day_str: str, month_str: str) -> str | None:
+        try:
+            day_num = int(day_str)
+        except Exception:
+            return None
+        month_num = _MONTH_TO_NUM.get((month_str or "").strip().lower())
+        if not month_num:
+            return None
+        try:
+            d = date(date.today().year, month_num, day_num)
+        except ValueError:
+            return None
+        return d.strftime("%A")
+
+    m = _DATE_DMY.search(text)
+    if m:
+        weekday = _weekday_for(m.group(1), m.group(2))
+        if weekday:
+            return text[:m.start()] + f"on {weekday}" + text[m.end():]
+
+    m = _DATE_MDY.search(text)
+    if m:
+        weekday = _weekday_for(m.group(2), m.group(1))
+        if weekday:
+            return text[:m.start()] + f"on {weekday}" + text[m.end():]
+
     return text
 
 
