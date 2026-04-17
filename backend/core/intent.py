@@ -116,6 +116,23 @@ _CHITCHAT_FEATURES = re.compile(
     re.IGNORECASE,
 )
 
+_DEPARTMENT_MISMATCH = re.compile(
+    r"\b(all\s+departments?|entire\s+college|all\s+branches?|whole\s+college|every\s+department)\b",
+    re.IGNORECASE,
+)
+
+_KNOWN_DEPARTMENTS = {
+    "AIML": re.compile(r"\b(ai\s*&\s*ml|aiml|a i m l|artificial\s+intelligence\s+and\s+machine\s+learning)\b", re.IGNORECASE),
+    "DCS": re.compile(r"\b(dcs|decision\s+and\s+computing\s+sciences|decision\s+computing\s+sciences)\b", re.IGNORECASE),
+    "CSE": re.compile(r"\b(cse|computer\s+science)\b", re.IGNORECASE),
+    "ECE": re.compile(r"\b(ece|electronics\s+and\s+communication)\b", re.IGNORECASE),
+    "IT": re.compile(r"\b(it|information\s+technology)\b", re.IGNORECASE),
+    "EEE": re.compile(r"\b(eee|electrical\s+and\s+electronics)\b", re.IGNORECASE),
+    "MECH": re.compile(r"\b(mech|mechanical)\b", re.IGNORECASE),
+    "CIVIL": re.compile(r"\b(civil)\b", re.IGNORECASE),
+    "AIDS": re.compile(r"\b(ai\s*&\s*ds|aids|artificial\s+intelligence\s+and\s+data\s+science)\b", re.IGNORECASE),
+}
+
 # Responsible-usage guardrail: refuse bulk personal data, secrets, or abusive requests.
 _RESPONSIBLE_USAGE_BLOCKED = re.compile(
     r"\b(" 
@@ -186,6 +203,19 @@ def responsible_usage_reply(question: str) -> str:
             "For safety, keep those out of chat and use your official access controls instead."
         )
 
+    if _DEPARTMENT_MISMATCH.search(question or ""):
+        return (
+            "I can’t provide cross-department or whole-college data for a department-scoped login. "
+            "Please ask about your own department or use an admin account for broader access."
+        )
+
+    for code, pattern in _KNOWN_DEPARTMENTS.items():
+        if pattern.search(question or ""):
+            return (
+                f"I can’t provide {code} data from this login because it is scoped to your department. "
+                "Please ask about your own department or use an admin account for other department data."
+            )
+
     return (
         "I can help with academic data, but I won’t assist with bulk personal-data exports or sensitive details "
         "unless the request is clearly authorized and narrowly scoped. Try a safer request like: "
@@ -193,7 +223,12 @@ def responsible_usage_reply(question: str) -> str:
     )
 
 
-def classify(question: str, pending: Optional[dict]) -> dict:
+def classify(
+    question: str,
+    pending: Optional[dict],
+    department_code: Optional[str] = None,
+    is_central_admin: bool = False,
+) -> dict:
     """
     Classify the user's intent.
 
@@ -210,6 +245,14 @@ def classify(question: str, pending: Optional[dict]) -> dict:
 
     if is_responsible_usage_blocked(q):
         return {"intent": Intent.UNSAFE, "question": q, "day": None, "pending": None}
+
+    if not is_central_admin and department_code:
+        dept = department_code.strip().lower()
+        if _DEPARTMENT_MISMATCH.search(q):
+            return {"intent": Intent.UNSAFE, "question": q, "day": None, "pending": None}
+        for code, pattern in _KNOWN_DEPARTMENTS.items():
+            if code.lower() != dept and pattern.search(q):
+                return {"intent": Intent.UNSAFE, "question": q, "day": None, "pending": None}
 
     # ── Check if user is replying to a pending clarification ─────────────────
     if pending and pending.get("type") == "day":

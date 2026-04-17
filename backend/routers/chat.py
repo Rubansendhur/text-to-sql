@@ -260,7 +260,12 @@ async def chat(
     session = store.get_or_create(user_id, session_id, dept)
 
     # ── Intent classification ─────────────────────────────────────────────────
-    classified = classify(raw_question, session.pending_clarification)
+    classified = classify(
+        raw_question,
+        session.pending_clarification,
+        department_code=dept,
+        is_central_admin=is_admin,
+    )
     intent     = classified["intent"]
     question   = classified["question"]   # "today" resolved to actual day if needed
 

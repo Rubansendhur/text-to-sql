@@ -26,7 +26,7 @@ const RESPONSIBLE_USAGE = [
   },
   {
     label: 'Keep requests narrow and authorized',
-    example: 'Show contact details for one student only when needed.',
+    example: 'Show your own department data only; AIML logins will not return DCS details.',
   },
 ]
 
