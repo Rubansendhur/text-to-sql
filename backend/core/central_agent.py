@@ -25,6 +25,7 @@ from core.response_generator import get_response_generator
 from core.session_store import SessionStore
 from core.chat_helpers import (
     build_semester_batch_sql, 
+    build_active_arrears_sql,
     build_free_staff_sql,
     build_parent_contact_sql,
     build_faculty_timetable_sql,
@@ -153,6 +154,11 @@ class CentralAgent:
         if sem_batch_sql:
             log.info("Using deterministic semester/batch shortcut.")
             return await self._execute_and_format(question, sem_batch_sql, 0)
+
+        active_arrears_sql = build_active_arrears_sql(question, department_code, is_central_admin)
+        if active_arrears_sql:
+            log.info("Using deterministic active-arrears shortcut.")
+            return await self._execute_and_format(question, active_arrears_sql, 0)
 
         # Context injection
         session = self.session_store.get(user_id, session_id)

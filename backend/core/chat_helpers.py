@@ -188,6 +188,22 @@ def normalize_sql(sql: str) -> str:
                 flags=re.IGNORECASE,
             )
 
+    # LLM sometimes emits invalid `exam_year = current_semester` against
+    # student_subject_attempts where `current_semester` is not a real column.
+    # Repair to a valid year-based predicate as a safe fallback.
+    sql = re.sub(
+        r"\bexam_year\s*=\s*current_semester\b",
+        "exam_year = EXTRACT(YEAR FROM CURRENT_DATE)::int",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    sql = re.sub(
+        r"\bcurrent_semester\s*=\s*exam_year\b",
+        "EXTRACT(YEAR FROM CURRENT_DATE)::int = exam_year",
+        sql,
+        flags=re.IGNORECASE,
+    )
+
     # class_timetable uses id + hour_number, not tt_id/slot_id.
     class_timetable_aliases = [alias for alias, table in alias_map.items() if table == "class_timetable"]
     time_slots_aliases = [alias for alias, table in alias_map.items() if table == "time_slots"]
