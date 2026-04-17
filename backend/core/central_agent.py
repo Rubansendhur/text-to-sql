@@ -25,6 +25,7 @@ from core.response_generator import get_response_generator
 from core.session_store import SessionStore
 from core.chat_helpers import (
     build_semester_batch_sql, 
+    build_free_staff_sql,
     build_parent_contact_sql,
     build_faculty_timetable_sql,
     extract_faculty_name_candidate,
@@ -132,6 +133,11 @@ class CentralAgent:
                 return await self._execute_and_format(question, parent_sql, 0)
 
         # ── Timetable shortcut ────────────────────────────────────────────────
+        free_staff_sql = build_free_staff_sql(question, department_code, is_central_admin)
+        if free_staff_sql:
+            log.info("Using deterministic free-staff shortcut.")
+            return await self._execute_and_format(question, free_staff_sql, 0)
+
         if any(k in q_lower for k in ["timetable", "schedule", "free", "hour", "slot", "record", "class", "teach", "period", "when does", "what time"]):
             cand = extract_faculty_name_candidate(question)
             faculty_name = await resolve_faculty_name(self.executor, cand, department_code, is_central_admin, role) if cand else None

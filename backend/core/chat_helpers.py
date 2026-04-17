@@ -766,6 +766,54 @@ def build_faculty_timetable_sql(
     )
 
 
+def build_free_staff_sql(
+    question: str,
+    department_code: str | None,
+    is_central_admin: bool,
+) -> str | None:
+    """
+    Deterministic SQL for queries like:
+      - "Which staff are free on Monday 2nd hour?"
+      - "Who is available on Tue 4th period?"
+
+    To avoid false positives, this shortcut only triggers when BOTH day and hour
+    are present in the question.
+    """
+    q = (question or "").lower()
+    is_free_query = any(k in q for k in ["free", "available", "not occupied"])
+    targets_staff = any(k in q for k in ["staff", "faculty", "teacher", "who"])
+    if not (is_free_query and targets_staff):
+        return None
+
+    day = normalize_day_token(question)
+    hour = extract_hour_token(question)
+    if not day or hour is None:
+        return None
+
+    where_parts = ["f.is_active = TRUE"]
+    if not is_central_admin and department_code:
+        where_parts.append(f"d.department_code = '{sql_quote(department_code)}'")
+
+    return (
+        "SELECT "
+        "f.full_name, f.designation, "
+        f"'{day}'::text AS day_of_week, "
+        f"{hour}::int AS hour_number "
+        "FROM faculty f "
+        "JOIN departments d ON f.department_id = d.department_id "
+        f"WHERE {' AND '.join(where_parts)} "
+        "AND NOT EXISTS ("
+        "SELECT 1 "
+        "FROM faculty_timetable ft "
+        "JOIN time_slots ts ON ft.slot_id = ts.slot_id "
+        "WHERE ft.faculty_id = f.faculty_id "
+        f"AND ft.day_of_week = '{day}' "
+        f"AND ts.hour_number = {hour}"
+        ") "
+        "ORDER BY f.full_name"
+    )
+
+
 def extract_faculty_name_candidate(question: str) -> str | None:
     """Extract likely faculty name mention from timetable-related questions."""
     q = (question or "").strip()

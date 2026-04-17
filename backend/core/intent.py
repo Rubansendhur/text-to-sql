@@ -39,6 +39,7 @@ _DAY_MAP = {
 }
 
 _TODAY_WORDS = re.compile(r"\btoday(?:'s|s)?\b", re.IGNORECASE)
+_TOMORROW_WORDS = re.compile(r"\btomorrow(?:'s|s)?\b", re.IGNORECASE)
 _DAY_PATTERN = re.compile(
     r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday"
     r"|tuesady|teusday|wednesady|wednsday|wensday|thrusday|thurday|satuday"
@@ -136,7 +137,7 @@ _KNOWN_DEPARTMENTS = {
 # Responsible-usage guardrail: refuse bulk personal data, secrets, or abusive requests.
 _RESPONSIBLE_USAGE_BLOCKED = re.compile(
     r"\b(" 
-    r"passwords?|passcodes?|otp|one\s*time\s*password|secret|api\s*key|token|private\s*key|"
+    r"passwords?|passcodes?|passwd|passwrd|passw?d|pswd|psswd|pwd|otp|one\s*time\s*password|secret|api\s*key|token|private\s*key|"
     r"personal\s*data|pii|sensitive\s*data|private\s*info|confidential|leak|dump|exfiltrate|"
     r"all\s+(?:students?|faculty|parents?)\s+(?:contact|phone|mobile|email|address)s?|"
     r"(?:contact|phone|mobile|email|address)s?\s+of\s+all\s+(?:students?|faculty|parents?)|"
@@ -159,24 +160,28 @@ def normalize_day(text: str) -> Optional[str]:
     return None
 
 
-def resolve_today(question: str) -> str:
+def resolve_relative_days(question: str) -> str:
     """
-    If the question says 'today' (but no explicit day), substitute the
-    actual weekday name so the LLM sees a concrete day.
-    e.g. "timetable for 7th sem today" → "timetable for 7th sem on Monday"
+    Resolve relative day words to concrete weekday names using system date.
+    e.g. "... today" -> "... on Monday", "... tomorrow" -> "... on Tuesday"
     """
-    if not _TODAY_WORDS.search(question):
+    if not (_TODAY_WORDS.search(question) or _TOMORROW_WORDS.search(question)):
         return question
     # don't substitute if an explicit day already appears
     if _DAY_PATTERN.search(question):
         return question
-    day = today_day_code()
+
+    offset = 1 if _TOMORROW_WORDS.search(question) else 0
+    day_idx = (date.today().weekday() + offset) % 7
+    day = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][day_idx]
     full_names = {
         "Mon": "Monday", "Tue": "Tuesday", "Wed": "Wednesday",
         "Thu": "Thursday", "Fri": "Friday", "Sat": "Saturday", "Sun": "Sunday",
     }
     full = full_names[day]
-    return _TODAY_WORDS.sub(f"on {full}", question)
+    text = _TODAY_WORDS.sub(f"on {full}", question)
+    text = _TOMORROW_WORDS.sub(f"on {full}", text)
+    return text
 
 
 # ── Intent classification ─────────────────────────────────────────────────────
@@ -197,7 +202,7 @@ def is_responsible_usage_blocked(question: str) -> bool:
 
 def responsible_usage_reply(question: str) -> str:
     ql = (question or "").lower()
-    if any(k in ql for k in ["password", "otp", "secret", "token", "api key", "private key"]):
+    if any(k in ql for k in ["password", "passwd", "passwrd", "pswd", "psswd", "pwd", "otp", "secret", "token", "api key", "private key"]):
         return (
             "I can’t help retrieve secrets, passwords, OTPs, API keys, or private tokens. "
             "For safety, keep those out of chat and use your official access controls instead."
@@ -281,8 +286,8 @@ def classify(
     if _CHITCHAT_WHO.search(ql) or _CHITCHAT_THANKS.match(q) or _CHITCHAT_ACK.match(q) or _CHITCHAT_FEATURES.search(ql):
         return {"intent": Intent.CHITCHAT, "question": q, "day": None, "pending": None}
 
-    # ── Resolve "today" → actual weekday ─────────────────────────────────────
-    resolved_q = resolve_today(q)
+    # ── Resolve relative days (today/tomorrow) → weekday ──────────────────────
+    resolved_q = resolve_relative_days(q)
 
     # ── Timetable question with no day mentioned at all ───────────────────────
     if _TIMETABLE_WORDS.search(resolved_q) and not _DAY_PATTERN.search(resolved_q):
@@ -398,6 +403,7 @@ def _inject_day(question: str, day_code: str) -> str:
         "Thu": "Thursday", "Fri": "Friday", "Sat": "Saturday", "Sun": "Sunday",
     }
     day_name = full_names.get(day_code, day_code)
-    # remove any leftover "today" references
-    q = _TODAY_WORDS.sub("", question).strip()
+    # remove any leftover relative-day references
+    q = _TODAY_WORDS.sub("", question)
+    q = _TOMORROW_WORDS.sub("", q).strip()
     return f"{q} on {day_name}"
