@@ -5,6 +5,7 @@ Utility helpers used by routers/chat.py.
 
 import os
 import re
+from datetime import date
 from fastapi import Request
 from core.rag_engine import get_rag_engine
 
@@ -661,10 +662,19 @@ def normalize_day_token(question: str) -> str | None:
         "thursday": "Thu", "thu": "Thu", "thur": "Thu", "thurs": "Thu", "thrusday": "Thu", "thurday": "Thu",
         "friday": "Fri", "fri": "Fri",
         "saturday": "Sat", "sat": "Sat", "satuday": "Sat",
+        "sunday": "Sun", "sun": "Sun",
     }
     for k, v in day_map.items():
         if re.search(rf"\b{k}\b", q):
             return v
+
+    # Relative day helpers for follow-up prompts like "tomorrow?"
+    if re.search(r"\btoday(?:'s|s)?\b", q, flags=re.IGNORECASE):
+        return ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][date.today().weekday()]
+    if re.search(r"\b(?:tomorrow|tommorow|tomoorow|tmr|tmrw)(?:'s|s)?\b", q, flags=re.IGNORECASE):
+        idx = (date.today().weekday() + 1) % 7
+        return ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][idx]
+
     return None
 
 
@@ -696,6 +706,26 @@ def build_faculty_timetable_sql(
     hour = extract_hour_token(question)
     q = (question or "").lower()
     is_free_query = any(k in q for k in ["free", "free period", "free slot", "available", "not occupied"])
+
+    # Institution policy: no regular timetable/free-slot results on Sundays.
+    if day == "Sun":
+        if is_free_query:
+            return (
+                "SELECT "
+                "NULL::text AS day_of_week, NULL::int AS hour_number, "
+                "NULL::time AS start_time, NULL::time AS end_time, "
+                "NULL::text AS subject_code, NULL::text AS subject_name, "
+                "NULL::smallint AS sem_batch, NULL::text AS activity "
+                "WHERE FALSE"
+            )
+        return (
+            "SELECT "
+            "NULL::text AS day_of_week, NULL::int AS hour_number, "
+            "NULL::time AS start_time, NULL::time AS end_time, "
+            "NULL::text AS subject_code, NULL::text AS subject_name, "
+            "NULL::smallint AS sem_batch, NULL::text AS activity "
+            "WHERE FALSE"
+        )
 
     if is_free_query:
         where_parts = [
@@ -789,6 +819,15 @@ def build_free_staff_sql(
     hour = extract_hour_token(question)
     if not day or hour is None:
         return None
+
+    # Institution policy: Sunday is a non-working day for timetable/free-staff lookups.
+    if day == "Sun":
+        return (
+            "SELECT "
+            "NULL::text AS full_name, NULL::text AS designation, "
+            "NULL::text AS day_of_week, NULL::int AS hour_number "
+            "WHERE FALSE"
+        )
 
     where_parts = ["f.is_active = TRUE"]
     if not is_central_admin and department_code:
