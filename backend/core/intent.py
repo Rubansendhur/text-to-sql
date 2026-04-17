@@ -25,6 +25,7 @@ Conversation state (kept in the in-memory session store)
 
 import re
 from datetime import date
+from difflib import get_close_matches
 from typing import Optional
 
 # ── Day helpers ───────────────────────────────────────────────────────────────
@@ -64,9 +65,9 @@ _MONTH_TO_NUM = {
     "nov": 11, "november": 11,
     "dec": 12, "december": 12,
 }
-_MONTH_ALT = r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
-_DATE_DMY = re.compile(rf"\b([0-3]?\d)\s*(?:st|nd|rd|th)?\s*(?:of\s+)?({_MONTH_ALT})\b", re.IGNORECASE)
-_DATE_MDY = re.compile(rf"\b({_MONTH_ALT})\s*([0-3]?\d)\s*(?:st|nd|rd|th)?\b", re.IGNORECASE)
+# Accept broad month tokens and normalize with typo tolerance (e.g., "arpil" -> "april").
+_DATE_DMY = re.compile(r"\b([0-3]?\d)\s*(?:st|nd|rd|th)?\s*(?:of\s+)?([A-Za-z]{3,10})\b", re.IGNORECASE)
+_DATE_MDY = re.compile(r"\b([A-Za-z]{3,10})\s*([0-3]?\d)\s*(?:st|nd|rd|th)?\b", re.IGNORECASE)
 
 _DATA_CUES = re.compile(
     r"\b(show|list|get|fetch|find|how many|count|which|who|what|students?|faculty|arrear|subject|"
@@ -207,12 +208,31 @@ def resolve_relative_days(question: str) -> str:
     if _DAY_PATTERN.search(text):
         return text
 
+    def _normalize_month(month_str: str) -> str | None:
+        token = (month_str or "").strip().lower()
+        if not token:
+            return None
+        if token in _MONTH_TO_NUM:
+            return token
+        # Common misspellings/shorthand for robustness.
+        alias = {
+            "janurary": "january", "febuary": "february", "fabruary": "february",
+            "marhc": "march", "april": "april", "arpil": "april", "aprill": "april",
+            "agust": "august", "auguest": "august", "setp": "sept", "sepember": "september",
+            "octomber": "october", "novembar": "november", "decembar": "december",
+        }
+        if token in alias:
+            return alias[token]
+        close = get_close_matches(token, list(_MONTH_TO_NUM.keys()), n=1, cutoff=0.78)
+        return close[0] if close else None
+
     def _weekday_for(day_str: str, month_str: str) -> str | None:
         try:
             day_num = int(day_str)
         except Exception:
             return None
-        month_num = _MONTH_TO_NUM.get((month_str or "").strip().lower())
+        month_key = _normalize_month(month_str)
+        month_num = _MONTH_TO_NUM.get(month_key) if month_key else None
         if not month_num:
             return None
         try:
