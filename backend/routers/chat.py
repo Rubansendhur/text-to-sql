@@ -64,6 +64,7 @@ from core.intent import (
     clarify_day_reply,
     chitchat_reply,
     greeting_reply,
+    responsible_usage_reply,
 )
 from core.session_store import Turn, get_session_store
 from core.sql_executor import get_executor
@@ -285,6 +286,18 @@ async def chat(
             user_id=user_id, session_id=session_id, question=raw_question,
             sql=None, response=reply, result_count=0,
             model_used="chat-intent", confidence="high", execution_ms=0,
+            error=None, department_code=dept, intent=intent,
+        )
+        return _text_response(session_id, raw_question, reply, message_id=message_id if message_id > 0 else None)
+
+    # ── Responsible usage guardrail ─────────────────────────────────────────
+    if intent == Intent.UNSAFE:
+        reply = responsible_usage_reply(raw_question)
+        session.add_turn(Turn(role="assistant", content=reply, intent=intent))
+        message_id = await _save_history(
+            user_id=user_id, session_id=session_id, question=raw_question,
+            sql=None, response=reply, result_count=0,
+            model_used="chat-policy", confidence="high", execution_ms=0,
             error=None, department_code=dept, intent=intent,
         )
         return _text_response(session_id, raw_question, reply, message_id=message_id if message_id > 0 else None)

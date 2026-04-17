@@ -11,6 +11,25 @@ const STARTERS = [
   'Show me 8th semester students from the 2022 batch.',
 ]
 
+const RESPONSIBLE_USAGE = [
+  {
+    label: 'Use for academic support',
+    example: 'Show the timetable for Tuesday 3rd hour.',
+  },
+  {
+    label: 'Prefer aggregation over personal data',
+    example: 'How many students are hostellers in 8th semester?',
+  },
+  {
+    label: 'Avoid secrets or private data',
+    example: 'Do not ask for passwords, OTPs, or API keys.',
+  },
+  {
+    label: 'Keep requests narrow and authorized',
+    example: 'Show contact details for one student only when needed.',
+  },
+]
+
 const CHAT_REQUEST_TIMEOUT_MS = 140000  // 140s to give backend time to finish
 
 let _uid = 0
@@ -267,6 +286,22 @@ export default function Chat() {
 
         {/* Messages */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '20px 24px' }}>
+          <div style={{ marginBottom: 14, padding: '14px 16px', borderRadius: 14, border: '1px solid #dbeafe', background: 'linear-gradient(180deg, #eff6ff 0%, #f8fbff 100%)' }}>
+            <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase', color: '#2563eb', marginBottom: 8 }}>
+              Ethical AI &amp; Responsible Usage
+            </div>
+            <div style={{ display: 'grid', gap: 8 }}>
+              {RESPONSIBLE_USAGE.map(item => (
+                <div key={item.label} style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 12, color: '#1f2937', lineHeight: 1.5 }}>
+                  <span style={{ width: 8, height: 8, borderRadius: 999, background: '#2563eb', marginTop: 6, flexShrink: 0 }} />
+                  <div>
+                    <div style={{ fontWeight: 700 }}>{item.label}</div>
+                    <div style={{ color: '#4b5563' }}>{item.example}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
           {messages.map(msg => (
             <MessageBubble
               key={msg.id}

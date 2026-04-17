@@ -116,6 +116,18 @@ _CHITCHAT_FEATURES = re.compile(
     re.IGNORECASE,
 )
 
+# Responsible-usage guardrail: refuse bulk personal data, secrets, or abusive requests.
+_RESPONSIBLE_USAGE_BLOCKED = re.compile(
+    r"\b(" 
+    r"passwords?|passcodes?|otp|one\s*time\s*password|secret|api\s*key|token|private\s*key|"
+    r"personal\s*data|pii|sensitive\s*data|private\s*info|confidential|leak|dump|exfiltrate|"
+    r"all\s+(?:students?|faculty|parents?)\s+(?:contact|phone|mobile|email|address)s?|"
+    r"(?:contact|phone|mobile|email|address)s?\s+of\s+all\s+(?:students?|faculty|parents?)|"
+    r"parent\s+contact\s+details|father\s+contact\s+numbers?|mother\s+contact\s+numbers?"
+    r")\b",
+    re.IGNORECASE,
+)
+
 
 def today_day_code() -> str:
     """Return today's DB day code (Mon/Tue/...)."""
@@ -161,6 +173,26 @@ class Intent:
     UNSAFE         = "unsafe"
 
 
+def is_responsible_usage_blocked(question: str) -> bool:
+    q = (question or "").strip()
+    return bool(q and _RESPONSIBLE_USAGE_BLOCKED.search(q))
+
+
+def responsible_usage_reply(question: str) -> str:
+    ql = (question or "").lower()
+    if any(k in ql for k in ["password", "otp", "secret", "token", "api key", "private key"]):
+        return (
+            "I can’t help retrieve secrets, passwords, OTPs, API keys, or private tokens. "
+            "For safety, keep those out of chat and use your official access controls instead."
+        )
+
+    return (
+        "I can help with academic data, but I won’t assist with bulk personal-data exports or sensitive details "
+        "unless the request is clearly authorized and narrowly scoped. Try a safer request like: "
+        '"How many students are in 8th semester?" or "Show the timetable for Tuesday 3rd hour."'
+    )
+
+
 def classify(question: str, pending: Optional[dict]) -> dict:
     """
     Classify the user's intent.
@@ -175,6 +207,9 @@ def classify(question: str, pending: Optional[dict]) -> dict:
     """
     q = (question or "").strip()
     ql = q.lower()
+
+    if is_responsible_usage_blocked(q):
+        return {"intent": Intent.UNSAFE, "question": q, "day": None, "pending": None}
 
     # ── Check if user is replying to a pending clarification ─────────────────
     if pending and pending.get("type") == "day":
