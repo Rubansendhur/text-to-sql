@@ -179,6 +179,22 @@ def normalize_day(text: str) -> Optional[str]:
     return None
 
 
+def _remove_day_mentions(text: str) -> str:
+    """Remove explicit weekday mentions so a clarified day can be injected cleanly."""
+    if not text:
+        return text
+    cleaned = re.sub(
+        r"\b(?:on\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+        r"|tuesady|teusday|wednesady|wednsday|wensday|thrusday|thurday|satuday"
+        r"|mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)\b",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,.-")
+    return cleaned or text
+
+
 def resolve_relative_days(question: str) -> str:
     """
     Resolve relative day words to concrete weekday names using system date.
@@ -361,16 +377,34 @@ def classify(
     # ── Resolve relative days (today/tomorrow) → weekday ──────────────────────
     resolved_q = resolve_relative_days(q)
 
-    # ── Timetable question with no day mentioned at all ───────────────────────
-    if _TIMETABLE_WORDS.search(resolved_q) and not _DAY_PATTERN.search(resolved_q):
-        # needs clarification
-        new_pending = {"type": "day", "original_question": resolved_q}
-        return {
-            "intent":   Intent.CLARIFY_DAY,
-            "question": resolved_q,
-            "day":      None,
-            "pending":  new_pending,
-        }
+    # ── Timetable-day handling ───────────────────────────────────────────────
+    if _TIMETABLE_WORDS.search(resolved_q):
+        day_code = normalize_day(resolved_q)
+
+        # Weekend query: ask user to confirm weekend classes / provide working day.
+        if day_code in {"Sat", "Sun"}:
+            base_q = _remove_day_mentions(resolved_q)
+            new_pending = {
+                "type": "day",
+                "original_question": base_q,
+                "reason": "weekend",
+            }
+            return {
+                "intent":   Intent.CLARIFY_DAY,
+                "question": base_q,
+                "day":      None,
+                "pending":  new_pending,
+            }
+
+        # No day at all: ask normal clarification.
+        if not _DAY_PATTERN.search(resolved_q):
+            new_pending = {"type": "day", "original_question": resolved_q}
+            return {
+                "intent":   Intent.CLARIFY_DAY,
+                "question": resolved_q,
+                "day":      None,
+                "pending":  new_pending,
+            }
 
     # If no clear data cue exists, avoid blind SQL generation that can drift
     # to broad default lists (often full student tables).

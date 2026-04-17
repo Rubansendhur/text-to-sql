@@ -313,7 +313,16 @@ async def chat(
 
     # ── Needs clarification (no day given for timetable) ─────────────────────
     if intent == Intent.CLARIFY_DAY:
-        reply = clarify_day_reply(question)
+        pending_reason = (classified.get("pending") or {}).get("reason")
+        if pending_reason == "weekend":
+            reply = (
+                "That looks like a weekend day (Saturday/Sunday). "
+                "Are weekend classes running in your timetable? "
+                "If yes, reply with that day again; otherwise tell me a working day "
+                "(e.g., Monday) and I will fetch it for that day."
+            )
+        else:
+            reply = clarify_day_reply(question)
         session.pending_clarification = classified["pending"]
         session.add_turn(Turn(role="assistant", content=reply, intent=intent))
         message_id = await _save_history(
