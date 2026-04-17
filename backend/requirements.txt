@@ -1,0 +1,35 @@
+# DCS Monitor Backend — Python dependencies
+# Install: pip install -r requirements.txt
+
+# Web framework
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# Database
+asyncpg>=0.29.0          # async PostgreSQL driver (used by sql_executor pool)
+sqlalchemy>=2.0.0        # sync ORM used by upload/ routes
+psycopg2-binary>=2.9.9   # sync psycopg2 fallback / SQLAlchemy dialect
+
+# File parsing
+pandas>=2.2.0
+openpyxl>=3.1.0          # Excel (.xlsx) support for pandas
+python-multipart>=0.0.9  # required for FastAPI file uploads (UploadFile)
+
+# Env / config
+python-dotenv>=1.0.0
+
+# Auth
+PyJWT>=2.8.0
+bcrypt>=4.1.0
+
+# AI / Ollama
+httpx>=0.27.0            # used by nl_to_sql and rag_engine for Ollama HTTP calls
+
+# ── RAG pipeline (Qdrant vector store) ────────────────────────────────────────
+# Start Qdrant locally: docker run -p 6333:6333 qdrant/qdrant
+qdrant-client>=1.9.0
+
+# Optional: pull Ollama embedding model instead of sentence-transformers
+# ollama pull nomic-embed-text
+# If you prefer a pure-Python embedding fallback (no Ollama required):
+# sentence-transformers>=2.7.0
