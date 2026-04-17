@@ -321,6 +321,11 @@ async def chat(
                 "If yes, reply with that day again; otherwise tell me a working day "
                 "(e.g., Monday) and I will fetch it for that day."
             )
+        elif pending_reason == "weekend_need_working_day":
+            reply = (
+                "No problem. Please tell me a working day (Monday to Friday), "
+                "and I will fetch the timetable/free-staff result for that day."
+            )
         else:
             reply = clarify_day_reply(question)
         session.pending_clarification = classified["pending"]

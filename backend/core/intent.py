@@ -92,6 +92,8 @@ _BARE_DAY_REPLY = re.compile(
     r"|mon|tue|tues|wed|thu|thur|thurs|fri|sat)\s*$",
     re.IGNORECASE,
 )
+_YES_REPLY = re.compile(r"^\s*(yes|yep|yeah|ya|ok|okay|sure|continue|proceed)\s*[!.?]*\s*$", re.IGNORECASE)
+_NO_REPLY = re.compile(r"^\s*(no|nope|nah|not now|cancel)\s*[!.?]*\s*$", re.IGNORECASE)
 
 # unsafe DML patterns
 _UNSAFE_SQL = re.compile(
@@ -196,6 +198,17 @@ def _remove_day_mentions(text: str) -> str:
     )
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,.-")
     return cleaned or text
+
+
+def _extract_day_code(text: str) -> Optional[str]:
+    """Resolve weekday token from direct/relative/explicit-date text."""
+    if not text:
+        return None
+    direct = normalize_day(text)
+    if direct:
+        return direct
+    resolved = resolve_relative_days(text)
+    return normalize_day(resolved)
 
 
 def resolve_relative_days(question: str) -> str:
@@ -352,15 +365,35 @@ def classify(
 
     # ── Check if user is replying to a pending clarification ─────────────────
     if pending and pending.get("type") == "day":
-        # bare day reply like "tuesday" or "on tuesday"
-        bare = _BARE_DAY_REPLY.match(q)
-        day_in_text = normalize_day(q)
-        if bare or day_in_text:
-            day = day_in_text or normalize_day(bare.group(1)) if bare else None
-            if day is None:
-                day = today_day_code()
-            # reconstruct the full question
-            orig = pending["original_question"]
+        orig = pending.get("original_question") or q
+        reason = (pending.get("reason") or "").strip().lower()
+
+        # Weekend follow-up acknowledgements.
+        if reason == "weekend" and _YES_REPLY.match(q):
+            weekend_day = pending.get("weekend_day") or "Sat"
+            full_q = _inject_day(orig, weekend_day)
+            return {
+                "intent": Intent.CLARIFY_REPLY,
+                "question": full_q,
+                "day": weekend_day,
+                "pending": None,
+            }
+
+        if reason == "weekend" and _NO_REPLY.match(q):
+            return {
+                "intent": Intent.CLARIFY_DAY,
+                "question": orig,
+                "day": None,
+                "pending": {
+                    "type": "day",
+                    "original_question": orig,
+                    "reason": "weekend_need_working_day",
+                },
+            }
+
+        # Accept explicit weekday, today/tomorrow, or explicit date replies.
+        day = _extract_day_code(q)
+        if day:
             full_q = _inject_day(orig, day)
             return {
                 "intent":   Intent.CLARIFY_REPLY,
@@ -391,6 +424,7 @@ def classify(
                 "type": "day",
                 "original_question": base_q,
                 "reason": "weekend",
+                "weekend_day": day_code,
             }
             return {
                 "intent":   Intent.CLARIFY_DAY,
