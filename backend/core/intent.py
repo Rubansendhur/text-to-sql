@@ -140,6 +140,12 @@ _CHITCHAT_FEATURES = re.compile(
     r"|\b(features?\s+of\s+the\s+(?:website|app|application|system|portal))\b",
     re.IGNORECASE,
 )
+_CHITCHAT_WORKING_DAY = re.compile(
+    r"\b(working\s*day|non-?working|holiday|weekend|off\s*day)\b"
+    r"|\b(is|are)\b.*\b(saturday|sunday|sat|sun|today|tomorrow|tmr|tmrw)\b.*\b(working|holiday|off)\b"
+    r"|\b(saturday|sunday|sat|sun|today|tomorrow|tmr|tmrw)\b.*\bworking\s*day\b",
+    re.IGNORECASE,
+)
 
 _DEPARTMENT_MISMATCH = re.compile(
     r"\b(all\s+departments?|entire\s+college|all\s+branches?|whole\s+college|every\s+department)\b",
@@ -407,7 +413,13 @@ def classify(
         return {"intent": Intent.GREETING, "question": q, "day": None, "pending": None}
 
     # ── Chitchat ─────────────────────────────────────────────────────────────
-    if _CHITCHAT_WHO.search(ql) or _CHITCHAT_THANKS.match(q) or _CHITCHAT_ACK.match(q) or _CHITCHAT_FEATURES.search(ql):
+    if (
+        _CHITCHAT_WHO.search(ql)
+        or _CHITCHAT_THANKS.match(q)
+        or _CHITCHAT_ACK.match(q)
+        or _CHITCHAT_FEATURES.search(ql)
+        or _CHITCHAT_WORKING_DAY.search(ql)
+    ):
         return {"intent": Intent.CHITCHAT, "question": q, "day": None, "pending": None}
 
     # ── Resolve relative days (today/tomorrow) → weekday ──────────────────────
@@ -511,6 +523,26 @@ def chitchat_reply(question: str, department_code: Optional[str]) -> str:
             "- Timetable and data upload modules\n"
             "- Ask AI for natural-language queries over your department data\n\n"
             "You can also rate AI responses with 👍/👎 to help improve future results."
+        )
+    if _CHITCHAT_WORKING_DAY.search(ql):
+        day = _extract_day_code(question)
+        if day == "Sun":
+            return (
+                "In this setup, **Sunday is treated as a non-working day**, "
+                "so timetable/free-slot results are not available for Sunday."
+            )
+        if day == "Sat":
+            return (
+                "**Saturday can vary by timetable policy**. "
+                "If your department runs Saturday classes, share the exact hour/day query and I will fetch it; "
+                "otherwise we can use a working weekday."
+            )
+        if day in {"Mon", "Tue", "Wed", "Thu", "Fri"}:
+            return "Yes, that is treated as a **working day** in this timetable flow."
+        return (
+            "Working-day policy here is: **Sunday is non-working**, "
+            "and weekday queries are supported directly. "
+            "For Saturday, it depends on your department timetable policy."
         )
     if "who are you" in ql:
         return (
