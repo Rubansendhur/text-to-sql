@@ -40,7 +40,10 @@ _DAY_MAP = {
 }
 
 _TODAY_WORDS = re.compile(r"\btoday(?:'s|s)?\b", re.IGNORECASE)
-_TOMORROW_WORDS = re.compile(r"\b(?:tomorrow|tommorow|tommorow|tomoorow|tmrw|tmr)(?:'s|s)?\b", re.IGNORECASE)
+_TOMORROW_WORDS = re.compile(
+    r"\b(?:tomorrow|tommorow|tomoorow|tommorrow|tommorow|tommorrow|tommmoorw|tmrw|tmr)\b",
+    re.IGNORECASE,
+)
 _DAY_PATTERN = re.compile(
     r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday"
     r"|tuesady|teusday|wednesady|wednsday|wensday|thrusday|thurday|satuday"

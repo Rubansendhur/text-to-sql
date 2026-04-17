@@ -671,7 +671,7 @@ def normalize_day_token(question: str) -> str | None:
     # Relative day helpers for follow-up prompts like "tomorrow?"
     if re.search(r"\btoday(?:'s|s)?\b", q, flags=re.IGNORECASE):
         return ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][date.today().weekday()]
-    if re.search(r"\b(?:tomorrow|tommorow|tomoorow|tmr|tmrw)(?:'s|s)?\b", q, flags=re.IGNORECASE):
+    if re.search(r"\b(?:tomorrow|tommorow|tomoorow|tommorrow|tommmoorw|tmr|tmrw)(?:'s|s)?\b", q, flags=re.IGNORECASE):
         idx = (date.today().weekday() + 1) % 7
         return ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][idx]
 
