@@ -578,6 +578,96 @@ def build_active_arrears_sql(question: str, department_code: str | None, is_cent
     )
 
 
+def build_active_vs_history_arrears_sql(
+    question: str,
+    department_code: str | None,
+    is_central_admin: bool,
+) -> str | None:
+    """Deterministic SQL for active-vs-history arrear count questions."""
+    q = (question or "").lower()
+    if "arrear" not in q and "backlog" not in q:
+        return None
+
+    history_terms = (
+        "history", "historical", "past", "previous", "ever had", "cleared", "resolved"
+    )
+    active_terms = ("active", "current", "still")
+    count_terms = ("how many", "count", "number", "total")
+
+    asks_history = any(t in q for t in history_terms)
+    asks_active = any(t in q for t in active_terms)
+    asks_count = any(t in q for t in count_terms)
+
+    # Only trigger this aggregate query for count-style prompts that mention history.
+    if not asks_history or not asks_count:
+        return None
+
+    sem_match = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s*(?:sem|semester)\b", q)
+    semester = int(sem_match.group(1)) if sem_match else None
+
+    semester_expr = (
+        "(EXTRACT(YEAR FROM CURRENT_DATE)::int - s.admission_year) * 2 "
+        "+ CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE) >= 7 THEN 1 ELSE 0 END"
+    )
+
+    scoped_where = ["s.status = 'Active'"]
+    if not is_central_admin and department_code:
+        scoped_where.append(f"d.department_code = '{sql_quote(department_code)}'")
+    if semester is not None:
+        scoped_where.append(f"{semester_expr} = {semester}")
+
+    active_select = (
+        "(SELECT COUNT(*) "
+        " FROM active_students a "
+        " JOIN scoped_students ss ON ss.student_id = a.student_id) AS active_students_count"
+    )
+    history_select = (
+        "(SELECT COUNT(*) "
+        " FROM history_cleared_students h "
+        " JOIN scoped_students ss ON ss.student_id = h.student_id) AS history_students_count"
+    )
+    if not asks_active:
+        # Keep column names stable; user asked history-only but can still benefit from both counts.
+        active_select = active_select
+
+    return (
+        "WITH latest_attempts AS ("
+        "    SELECT student_id, subject_id, exam_year, exam_month, grade,"
+        "           ROW_NUMBER() OVER("
+        "               PARTITION BY student_id, subject_id "
+        "               ORDER BY exam_year DESC, "
+        "                        CASE WHEN exam_month = 'NOV' THEN 11 WHEN exam_month = 'MAY' THEN 5 ELSE 1 END DESC,"
+        "                        attempt_id DESC"
+        "           ) AS rn"
+        "    FROM student_subject_attempts"
+        "), active_students AS ("
+        "    SELECT DISTINCT student_id"
+        "    FROM latest_attempts"
+        "    WHERE rn = 1 AND grade IN ('U', 'AB')"
+        "), historical_students AS ("
+        "    SELECT DISTINCT student_id"
+        "    FROM student_subject_attempts"
+        "    WHERE grade IN ('U', 'AB')"
+        "), history_cleared_students AS ("
+        "    SELECT hs.student_id"
+        "    FROM historical_students hs"
+        "    LEFT JOIN active_students a ON a.student_id = hs.student_id"
+        "    WHERE a.student_id IS NULL"
+        "), scoped_students AS ("
+        "    SELECT s.student_id"
+        "    FROM students s"
+        "    JOIN departments d ON s.department_id = d.department_id"
+        f"    WHERE {' AND '.join(scoped_where)}"
+        ") "
+        "SELECT "
+        f"{active_select}, "
+        f"{history_select}, "
+        "(SELECT COUNT(*) "
+        " FROM historical_students h "
+        " JOIN scoped_students ss ON ss.student_id = h.student_id) AS ever_had_arrear_count"
+    )
+
+
 def build_parent_contact_sql(
     question: str,
     department_code: str | None,
