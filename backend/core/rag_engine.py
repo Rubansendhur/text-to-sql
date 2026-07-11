@@ -122,6 +122,8 @@ parents(parent_id PK, student_id FK, father_name, mother_name,
  
 faculty(faculty_id PK, title, full_name, designation, email, phone,
   department_id FK, is_hod BOOLEAN, is_active BOOLEAN)
+  -- full_name = the faculty member's NAME; title = honorific only (Dr/Mr/Ms).
+  -- To list faculty, always SELECT f.full_name (optionally f.title too), never title alone.
   -- faculty has NO day_of_week/slot_id/hour_number cols -- those live in faculty_timetable
  
 subjects(subject_id PK, subject_code, subject_name, department_id FK, semester_number INT,
@@ -623,4 +625,3 @@ _rag_engine = RagEngine()
  
 def get_rag_engine() -> RagEngine:
     return _rag_engine
- 

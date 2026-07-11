@@ -1,5 +1,6 @@
 import logging
 import time
+import asyncio
 from sqlalchemy import text
 from upload.helpers import get_db
 
@@ -24,7 +25,8 @@ class SQLExecutor:
     async def close(self):
         pass
 
-    async def run(self, sql: str, params: dict = None, role: str = "hod"):
+    def _run_sync(self, sql: str, params: dict = None):
+        """Blocking DB call — runs in a worker thread, never on the event loop."""
         engine = get_db()
         start  = time.perf_counter()
         try:
@@ -49,6 +51,11 @@ class SQLExecutor:
             elapsed = (time.perf_counter() - start) * 1000
             log.error(f"SQL execution error: {e}")
             return Result(rows=[], row_count=0, error=str(e), execution_ms=round(elapsed, 1))
+
+    async def run(self, sql: str, params: dict = None, role: str = "hod"):
+        # The SQLAlchemy engine is synchronous; offload to a thread so a slow
+        # query can't block every other in-flight request on the event loop.
+        return await asyncio.to_thread(self._run_sync, sql, params)
 
 executor = SQLExecutor()
 

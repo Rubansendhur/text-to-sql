@@ -24,7 +24,7 @@ from core.sql_executor import SQLExecutor
 from core.response_generator import get_response_generator
 from core.session_store import SessionStore
 from core.chat_helpers import (
-    build_semester_batch_sql, 
+    build_semester_batch_sql,
     build_active_vs_history_arrears_sql,
     build_active_arrears_sql,
     build_free_staff_sql,
@@ -32,15 +32,16 @@ from core.chat_helpers import (
     build_faculty_timetable_sql,
     extract_faculty_name_candidate,
     resolve_faculty_name,
-    force_department_scope,
-    normalize_sql,
     normalize_subject_list_sql,
+    expand_fuzzy_name_matches,
 )
+from core.sql_corrections import apply_schema_corrections, apply_department_scope
+from core.sql_correction_log import log_correction
 
 log = logging.getLogger(__name__)
 
 # Fast-fail budget config
-MAX_LLM_CALLS = 2   # 1 initial + 1 retry max (no infinite or cascading loops)
+MAX_LLM_CALLS = 10   # 1 initial + 1 retry max (no infinite or cascading loops)
 # Backend has NO hardcoded timeout — only frontend timeout matters (125s).
 # This allows sqlcoder to finish at its own pace without artificial backend cutoff.
 MAX_TIMEOUT_S = None  # Disabled; frontend 125s is the real limit
@@ -132,13 +133,13 @@ class CentralAgent:
             parent_sql = build_parent_contact_sql(question, department_code, is_central_admin)
             if parent_sql:
                 log.info("Using deterministic parent-contact shortcut.")
-                return await self._execute_and_format(question, parent_sql, 0)
+                return await self._execute_and_format(question, parent_sql, 0, user_id, session_id)
 
         # ── Timetable shortcut ────────────────────────────────────────────────
         free_staff_sql = build_free_staff_sql(question, department_code, is_central_admin)
         if free_staff_sql:
             log.info("Using deterministic free-staff shortcut.")
-            return await self._execute_and_format(question, free_staff_sql, 0)
+            return await self._execute_and_format(question, free_staff_sql, 0, user_id, session_id)
 
         if any(k in q_lower for k in ["timetable", "schedule", "free", "hour", "slot", "record", "class", "teach", "period", "when does", "what time"]):
             cand = extract_faculty_name_candidate(question)
@@ -147,24 +148,24 @@ class CentralAgent:
             if faculty_name:
                 log.info("Using deterministic timetable shortcut for faculty: %s", faculty_name)
                 sql = build_faculty_timetable_sql(question, faculty_name, department_code, is_central_admin)
-                result = await self._execute_and_format(question, sql, 0)
+                result = await self._execute_and_format(question, sql, 0, user_id, session_id)
                 result.resolved_faculty = faculty_name
                 return result
 
         sem_batch_sql = build_semester_batch_sql(question, department_code, is_central_admin)
         if sem_batch_sql:
             log.info("Using deterministic semester/batch shortcut.")
-            return await self._execute_and_format(question, sem_batch_sql, 0)
+            return await self._execute_and_format(question, sem_batch_sql, 0, user_id, session_id)
 
         active_vs_history_sql = build_active_vs_history_arrears_sql(question, department_code, is_central_admin)
         if active_vs_history_sql:
             log.info("Using deterministic active-vs-history arrears shortcut.")
-            return await self._execute_and_format(question, active_vs_history_sql, 0)
+            return await self._execute_and_format(question, active_vs_history_sql, 0, user_id, session_id)
 
         active_arrears_sql = build_active_arrears_sql(question, department_code, is_central_admin)
         if active_arrears_sql:
             log.info("Using deterministic active-arrears shortcut.")
-            return await self._execute_and_format(question, active_arrears_sql, 0)
+            return await self._execute_and_format(question, active_arrears_sql, 0, user_id, session_id)
 
         # Context injection
         session = self.session_store.get(user_id, session_id)
@@ -183,14 +184,16 @@ class CentralAgent:
                 core_result = await asyncio.wait_for(
                     self._run_agent_loop(
                         full_prompt, role, department_code, is_central_admin,
-                        llm_calls_made, current_hint, validation_issues
+                        llm_calls_made, current_hint, validation_issues,
+                        user_id, session_id,
                     ),
                     timeout=MAX_TIMEOUT_S
                 )
             else:
                 core_result = await self._run_agent_loop(
                     full_prompt, role, department_code, is_central_admin,
-                    llm_calls_made, current_hint, validation_issues
+                    llm_calls_made, current_hint, validation_issues,
+                    user_id, session_id,
                 )
         except asyncio.TimeoutError:
             log.error("[Agent] Budget exceeded (%ds timeout breached).", MAX_TIMEOUT_S)
@@ -214,12 +217,16 @@ class CentralAgent:
             core_result.display_data = resp_dict.get("data", core_result.display_data)
         except Exception as fmt_err:
             log.warning("[Agent] Prose formatting failed (non-fatal): %s", fmt_err)
-            # Keep the fallback summary already in core_result.response
+            # Deferred path starts with an empty response, so supply a minimal
+            # summary rather than returning a blank message to the user.
+            if not core_result.response:
+                core_result.response = f"Found {core_result.result_count} result(s)."
 
         return core_result
 
     async def _run_agent_loop(
-        self, prompt, role, dept, is_admin, llm_calls, hint, validation_issues
+        self, prompt, role, dept, is_admin, llm_calls, hint, validation_issues,
+        user_id: str = "unknown", session_id: str = "unknown",
     ) -> AgentResult:
         from core.sql_validator import hint_from_db_error
 
@@ -242,9 +249,20 @@ class CentralAgent:
                     model_used=model
                 )
 
-            # Apply deterministic SQL normalizations before validation.
-            sql = normalize_sql(nl_res.sql)
+            # Apply deterministic schema-drift corrections (AST-based, see
+            # core.sql_corrections) before validation — these are
+            # unconditionally-correct rewrites, not ambiguous cases, so
+            # there's no reason to burn an LLM retry on something we can
+            # just fix.
+            correction = apply_schema_corrections(nl_res.sql)
+            sql = expand_fuzzy_name_matches(correction.sql)
             sql = normalize_subject_list_sql(sql, question=prompt)
+            if correction.applied_rules:
+                await log_correction(
+                    user_id=user_id, session_id=session_id, question=prompt,
+                    original_sql=nl_res.sql, corrected_sql=correction.sql,
+                    rule_names=correction.applied_rules, department_code=dept,
+                )
 
             # ── Validate (zero latency) ───────────────────────────────────────
             val_res = self._tool_validate_sql(sql, dept, is_admin)
@@ -265,8 +283,8 @@ class CentralAgent:
             if dept and not is_admin and any(
                 "Missing mandatory department scope" in e for e in (val_res.errors or [])
             ):
-                forced_sql = force_department_scope(sql, dept)
-                if forced_sql and forced_sql != sql:
+                forced_sql, scope_changed = apply_department_scope(sql, dept)
+                if scope_changed and forced_sql != sql:
                     forced_val = self._tool_validate_sql(forced_sql, dept, is_admin)
                     if forced_val.is_valid or forced_val.fixed_sql:
                         final_sql = forced_val.fixed_sql or forced_sql
@@ -274,6 +292,11 @@ class CentralAgent:
                         log.info(
                             "[Agent] Injected department scope deterministically on attempt #%d",
                             llm_calls,
+                        )
+                        await log_correction(
+                            user_id=user_id, session_id=session_id, question=prompt,
+                            original_sql=sql, corrected_sql=final_sql,
+                            rule_names=["department_scope_injection"], department_code=dept,
                         )
                         break
 
@@ -298,7 +321,8 @@ class CentralAgent:
             )
 
         # ── Phase 2: Execute ──────────────────────────────────────────────────
-        final_sql = normalize_sql(final_sql)
+        final_sql = apply_schema_corrections(final_sql).sql
+        final_sql = expand_fuzzy_name_matches(final_sql)
         final_sql = normalize_subject_list_sql(final_sql, question=prompt)
         log.info("[Agent] Executing SQL: %.120s", final_sql)
         db_res = await self._tool_execute_sql(final_sql)
@@ -312,10 +336,18 @@ class CentralAgent:
                 nl_retry = await self._tool_generate_sql(prompt, role, retry_hint, dept, is_admin)
 
                 if not nl_retry.error and nl_retry.sql:
-                    retry_candidate = normalize_sql(nl_retry.sql)
+                    retry_correction = apply_schema_corrections(nl_retry.sql)
+                    retry_candidate = expand_fuzzy_name_matches(retry_correction.sql)
                     retry_candidate = normalize_subject_list_sql(retry_candidate, question=prompt)
+                    if retry_correction.applied_rules:
+                        await log_correction(
+                            user_id=user_id, session_id=session_id, question=prompt,
+                            original_sql=nl_retry.sql, corrected_sql=retry_correction.sql,
+                            rule_names=retry_correction.applied_rules, department_code=dept,
+                        )
                     val_retry = self._tool_validate_sql(retry_candidate, dept, is_admin)
-                    retry_sql = normalize_sql(val_retry.fixed_sql or retry_candidate)
+                    retry_sql = apply_schema_corrections(val_retry.fixed_sql or retry_candidate).sql
+                    retry_sql = expand_fuzzy_name_matches(retry_sql)
                     retry_sql = normalize_subject_list_sql(retry_sql, question=prompt)
                     retry_db = await self._tool_execute_sql(retry_sql)
 
@@ -351,15 +383,32 @@ class CentralAgent:
                 validation_errors=validation_issues,
             )
 
-        # ── Phase 3: Natural language response via LLM ────────────────────────
-        log.info("[Agent] Query returned %d rows. Generating NL response.", db_res.row_count)
-        resp_dict = await self._tool_format_response(prompt, final_sql, db_res.rows, db_res.columns)
+        # ── Phase 3: defer NL formatting to the caller ───────────────────────
+        # The caller (handle_data_query) runs the formatter exactly once,
+        # outside the timeout window. Formatting here too caused the prose LLM
+        # to run twice per query. Empty results need no LLM, so finalize them here.
+        log.info("[Agent] Query returned %d rows.", db_res.row_count)
+
+        if db_res.row_count == 0:
+            return AgentResult(
+                sql=final_sql,
+                response="No results found for that query. Try adjusting your filters or rephrasing.",
+                display_type="empty",
+                display_data={"message": "No data available"},
+                results_json=[],
+                columns=db_res.columns,
+                result_count=0,
+                confidence="high" if llm_calls == 1 else "medium",
+                model_used=model,
+                execution_ms=db_res.execution_ms,
+                validation_errors=validation_issues,
+            )
 
         return AgentResult(
             sql=final_sql,
-            response=resp_dict.get("summary", ""),
-            display_type=resp_dict.get("display_type", "table"),
-            display_data=resp_dict.get("data", {}),
+            response="",   # filled in by caller (single format pass, outside timeout window)
+            display_type="table",
+            display_data={},
             results_json=db_res.rows,
             columns=db_res.columns,
             result_count=db_res.row_count,
@@ -369,9 +418,23 @@ class CentralAgent:
             validation_errors=validation_issues,
         )
 
-    async def _execute_and_format(self, question: str, sql: str, ms_offset: int) -> AgentResult:
-        """Helper for deterministic rules that skip generation & validation."""
-        sql = normalize_sql(sql)
+    async def _execute_and_format(
+        self, question: str, sql: str, ms_offset: int,
+        user_id: str = "unknown", session_id: str = "unknown",
+    ) -> AgentResult:
+        """Helper for deterministic rules that skip generation & validation.
+        These generators produce known-good SQL by construction, so the
+        corrections pass here is a cheap safety net (protects against a
+        future edit to a build_*_sql generator accidentally reintroducing a
+        bad column reference), not a load-bearing repair step."""
+        correction = apply_schema_corrections(sql)
+        if correction.applied_rules:
+            await log_correction(
+                user_id=user_id, session_id=session_id, question=question,
+                original_sql=sql, corrected_sql=correction.sql,
+                rule_names=correction.applied_rules,
+            )
+        sql = expand_fuzzy_name_matches(correction.sql)
         db_res = await self._tool_execute_sql(sql)
         if db_res.error:
             log.error("[Agent] Deterministic SQL error: %s", db_res.error)

@@ -12,9 +12,13 @@ The LLM sometimes generates SQL that references:
   • Missing JOINs for required columns
   • Columns from one table placed on another table alias
 
-This agent catches those errors cheaply (no DB round-trip) and either
-auto-fixes them or returns a structured error so the pipeline can retry
-with a targeted hint.
+This agent catches those errors cheaply (no DB round-trip) and returns a
+structured error so the pipeline can retry with a targeted hint. Table/alias/
+column extraction is done via core.sql_ast (sqlglot AST), not regex — this
+module is now pure detect+hint, no SQL mutation. Deterministic auto-fixes
+(e.g. timetable columns misplaced on the faculty alias) live in
+core.sql_corrections and run BEFORE this validator, so a query that reaches
+here has already had the unambiguous rewrites applied.
 
 Usage
 ─────
@@ -31,107 +35,20 @@ import re
 import logging
 from dataclasses import dataclass, field
 
+from core.sql_ast import try_parse, get_table_aliases, get_column_refs
+from core.schema_catalog import (
+    TIMETABLE_ONLY_COLS,
+    COMMON_PROBLEMS,
+    get_columns,
+    table_exists,
+)
+
 log = logging.getLogger(__name__)
-
-# ── Schema: table → set of valid column names ─────────────────────────────────
-SCHEMA: dict[str, set[str]] = {
-    "departments": {
-        "department_id", "department_code", "department_name", "created_at",
-    },
-    "students": {
-        "student_id", "register_number", "name", "gender", "date_of_birth",
-        "contact_number", "email", "department_id", "admission_year", "section",
-        "hostel_status", "status", "cgpa", "created_at",
-    },
-    "faculty": {
-        "faculty_id", "title", "full_name", "designation", "email", "phone",
-        "department_id", "is_hod", "is_active", "created_at",
-        # Common mistake: these do NOT exist on faculty
-        # day_of_week, slot_id, hour_number, activity, sem_batch → faculty_timetable
-    },
-    "subjects": {
-        "subject_id", "subject_code", "subject_name", "department_id",
-        "semester_number", "subject_type", "lecture_hrs", "tutorial_hrs",
-        "practical_hrs", "credits", "created_at",
-    },
-    "parents": {
-        "parent_id", "student_id", "father_name", "mother_name",
-        "father_contact_number", "mother_contact_number", "address",
-    },
-    "student_subject_attempts": {
-        "attempt_id", "student_id", "subject_id", "exam_year", "exam_month", "grade", "created_at",
-    },
-    "student_subject_results": {
-        "id", "student_id", "subject_id", "semester_number", "grade", "exam_year", "exam_month", "created_at",
-    },
-    "student_semester_gpa": {
-        "student_id", "semester_number", "gpa", "total_credits",
-    },
-    "faculty_timetable": {
-        "tt_id", "faculty_id", "day_of_week", "slot_id", "subject_id",
-        "activity", "sem_batch", "department_id", "updated_at",
-    },
-    "class_timetable": {
-        "id", "sem_batch", "department_id", "section", "day_of_week",
-        "hour_number", "subject_id", "faculty_id", "activity",
-    },
-    "time_slots": {
-        "slot_id", "hour_number", "start_time", "end_time", "label",
-    },
-    "users": {
-        "user_id", "username", "password", "role", "department_code",
-    },
-    # Views
-    "vw_arrear_count": {
-        "register_number", "name", "status", "active_arrear_count",
-    },
-    "vw_timetable": {
-        "day_of_week", "hour_number", "time_range", "code", "subject",
-        "subject_type", "faculty_name", "lecture_hall", "notes", "semester_number",
-    },
-}
-
-# Columns that ONLY belong to faculty_timetable, never on faculty/departments
-_TIMETABLE_ONLY_COLS = {"day_of_week", "slot_id", "hour_number", "activity", "sem_batch"}
-
-# Pattern: alias.column  (e.g.  f.day_of_week  or  faculty.slot_id)
-_ALIAS_COL_PAT = re.compile(
-    r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\.\s*([a-zA-Z_][a-zA-Z0-9_]*)\b'
-)
-
-# Detect which real table an alias refers to inside FROM/JOIN clauses
-_FROM_ALIAS_PAT = re.compile(
-    r'\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)',
-    re.IGNORECASE,
-)
-
-COMMON_PROBLEMS = [
-    "sem_batch is INTEGER — never use ILIKE or string comparisons",
-    "day_of_week uses 3-letter codes: 'Mon','Tue','Wed','Thu','Fri','Sat'",
-    "faculty table has NO day_of_week/slot_id/hour_number — use faculty_timetable",
-    "faculty_timetable uses slot_id, not hour_number",
-    "class_timetable uses id and hour_number — never use tt_id or slot_id there",
-    "current_semester is derived from admission_year — do not query it as a stored column",
-    "Use time_slots.hour_number when user says 'Nth hour', not slot_id directly",
-    "student_subject_attempts PK is attempt_id, not id",
-    "faculty_timetable PK is tt_id, not id",
-    "student_semester_gpa has no cgpa_upto column. Use gpa or total_credits.",
-]
 
 # Detect timetable column on faculty alias specifically
 _FACULTY_TT_COL_PAT = re.compile(
     r'\b(?:f|faculty)\s*\.\s*(day_of_week|slot_id|hour_number|activity|sem_batch)\b',
     re.IGNORECASE,
-)
-
-# Detect sem mention ("8th sem", "8 sem", "8th semester")
-_SEM_MENTION_PAT = re.compile(
-    r'\b(\d+)(?:st|nd|rd|th)?\s*(?:sem(?:ester)?)\b', re.IGNORECASE
-)
-
-# Detect "8th SEM" used as a WHERE clause against faculty timetable sem_batch
-_SEM_BATCH_IN_FACULTY_WHERE = re.compile(
-    r'\b(?:ft|faculty_timetable)\s*\.\s*sem_batch\s*=\s*(\d+)', re.IGNORECASE
 )
 
 
@@ -265,6 +182,7 @@ def validate_sql(
     Validate SQL against the known schema.
 
     Checks performed (in order):
+      0. Must be parseable PostgreSQL (sqlglot AST)
       1. Must be a SELECT statement
       2. Faculty timetable columns must not appear on the faculty alias
       3. Department scope for non-admin users
@@ -283,44 +201,50 @@ def validate_sql(
 
     sql = sql.strip()
 
-    # ── Check 1: Must be SELECT ───────────────────────────────────────────────
-    if not re.match(r'^\s*SELECT\b', sql, re.IGNORECASE):
+    # ── Check 0: Must be parseable PostgreSQL ─────────────────────────────────
+    tree = try_parse(sql)
+    if tree is None:
+        result.is_valid = False
+        result.errors.append("SQL failed to parse (syntax error).")
+        result.hint = (
+            "The SQL is not valid PostgreSQL syntax. Return a single "
+            "well-formed SELECT statement."
+        )
+        return result
+
+    # ── Check 1: Must be SELECT (a leading WITH ... is a CTE, still read-only) ─
+    if not re.match(r'^\s*(WITH\b|SELECT\b)', sql, re.IGNORECASE):
         result.is_valid = False
         result.errors.append("SQL does not start with SELECT")
         result.hint = "Return only a SELECT statement. No DML (INSERT/UPDATE/DELETE/DROP)."
         return result
 
     # ── Check 2: Timetable cols on faculty alias ──────────────────────────────
+    # (No auto-fix here — the unambiguous rewrite already happened in
+    # core.sql_corrections before validate_sql was called. If it's still
+    # present, faculty_timetable wasn't joined, and that's a genuine
+    # structural error worth an LLM retry.)
     tt_on_faculty = _FACULTY_TT_COL_PAT.findall(sql)
     if tt_on_faculty:
         bad_cols = ", ".join(set(tt_on_faculty))
+        result.is_valid = False
         result.errors.append(
             f"Columns [{bad_cols}] are on faculty_timetable, NOT on faculty. "
             "Use ft.{col} with FROM faculty_timetable ft JOIN faculty f ..."
         )
-        # Attempt auto-fix
-        fixed = _fix_timetable_on_faculty(sql)
-        if fixed and fixed != sql:
-            result.fixed_sql = fixed
-            result.warnings.append("Auto-fixed: moved timetable columns to faculty_timetable alias.")
-            log.info("Auto-fixed timetable column misplacement. Fixed SQL: %s", fixed[:200])
-        else:
-            result.is_valid = False
-            result.hint = (
-                "CRITICAL FIX NEEDED: columns day_of_week/slot_id/hour_number/activity/sem_batch "
-                "belong to faculty_timetable (alias ft), NOT to faculty (alias f).\n"
-                "CORRECT pattern:\n"
-                "  FROM faculty_timetable ft\n"
-                "  JOIN faculty f ON ft.faculty_id = f.faculty_id\n"
-                "  JOIN time_slots ts ON ft.slot_id = ts.slot_id\n"
-                "  WHERE ft.day_of_week = '...' AND ts.hour_number = ...\n"
-                "NEVER use f.day_of_week or f.slot_id."
-            )
+        result.hint = (
+            "CRITICAL FIX NEEDED: columns day_of_week/slot_id/hour_number/activity/sem_batch "
+            "belong to faculty_timetable (alias ft), NOT to faculty (alias f).\n"
+            "CORRECT pattern:\n"
+            "  FROM faculty_timetable ft\n"
+            "  JOIN faculty f ON ft.faculty_id = f.faculty_id\n"
+            "  JOIN time_slots ts ON ft.slot_id = ts.slot_id\n"
+            "  WHERE ft.day_of_week = '...' AND ts.hour_number = ...\n"
+            "NEVER use f.day_of_week or f.slot_id."
+        )
 
     # ── Check 3a: Strip/fix leftover {DEPT} placeholder for central admins ────
     if is_central_admin and "{DEPT}" in sql:
-        # Auto-fix: remove the literal placeholder clauses
-        import re as _re
         fixed_admin = sql
         for pat in [
             r"\s*AND\s+d\.department_code\s*=\s*'?\{DEPT\}'?",
@@ -328,7 +252,7 @@ def validate_sql(
             r"\s*AND\s+department_code\s*=\s*'?\{DEPT\}'?",
             r"\s*WHERE\s+department_code\s*=\s*'?\{DEPT\}'?",
         ]:
-            fixed_admin = _re.sub(pat, "", fixed_admin, flags=_re.IGNORECASE)
+            fixed_admin = re.sub(pat, "", fixed_admin, flags=re.IGNORECASE)
         fixed_admin = fixed_admin.strip()
         if "{DEPT}" not in fixed_admin:
             result.fixed_sql = fixed_admin
@@ -399,17 +323,10 @@ def validate_sql(
         if result.is_valid:
             result.is_valid = False
 
-    # ── Check 5.5: Explicitly validate table names ────────────────────────────
-    invalid_tables = []
-    # Collect CTE names to allow them as valid tables
-    cte_names = [cte.lower() for cte in re.findall(r'\bWITH\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s*\(', sql, re.IGNORECASE)]
-    valid_tables = set(SCHEMA.keys()).union(set(cte_names))
+    # ── Check 5.5: Explicitly validate table names (AST-based) ───────────────
+    table_refs = get_table_aliases(tree)
+    invalid_tables = sorted({r.name for r in table_refs if not r.is_cte and not table_exists(r.name)})
 
-    for match in _FROM_ALIAS_PAT.finditer(sql):
-        table = match.group(1).lower()
-        if table not in valid_tables:
-            invalid_tables.append(table)
-            
     if invalid_tables:
         result.is_valid = False
         result.errors.append(f"Unknown table(s): {', '.join(invalid_tables)}")
@@ -419,17 +336,12 @@ def validate_sql(
             "Only use tables from the provided schema."
         )
 
-    # ── Check 5.6: Hallucinated 'id' column ───────────────────────────────────
-    sql_no_strings = re.sub(r"'[^']*'", "''", sql)
-    if re.search(r'\bid\b', sql_no_strings, re.IGNORECASE):
-        # The query uses 'id'. Do ANY of the queried tables actually have 'id'?
-        has_id_table = False
-        queried_tables = [match.group(1).lower() for match in _FROM_ALIAS_PAT.finditer(sql)]
-        for t in queried_tables:
-            if t in SCHEMA and "id" in SCHEMA[t]:
-                has_id_table = True
-                break
-        
+    # ── Check 5.6: Hallucinated 'id' column (AST-based) ───────────────────────
+    column_refs = get_column_refs(tree)
+    if any(col == "id" for _, col in column_refs):
+        queried_tables = {r.name for r in table_refs if not r.is_cte}
+        has_id_table = any("id" in get_columns(t) for t in queried_tables)
+
         if not has_id_table:
             result.is_valid = False
             result.errors.append("Column 'id' does not exist on any queried tables.")
@@ -438,9 +350,9 @@ def validate_sql(
                 "Use the correct primary/foreign keys (e.g., student_id, faculty_id, department_id, tt_id, attempt_id)."
             )
 
-    # ── Check 6: Alias-to-table mapping conflicts ─────────────────────────────
-    alias_map = _build_alias_map(sql)
-    alias_errors = _check_alias_columns(sql, alias_map)
+    # ── Check 6: Alias-to-table mapping conflicts (AST-based) ─────────────────
+    alias_map = {r.alias: r.name for r in table_refs if not r.is_cte}
+    alias_errors = _check_alias_columns(column_refs, alias_map)
     if alias_errors:
         result.errors.extend(alias_errors)
         if result.is_valid:
@@ -470,77 +382,21 @@ def validate_sql(
     return result
 
 
-# ── Auto-fixer ────────────────────────────────────────────────────────────────
-def _fix_timetable_on_faculty(sql: str) -> str:
+def _check_alias_columns(
+    column_refs: list[tuple[str | None, str]], alias_map: dict[str, str]
+) -> list[str]:
     """
-    Rewrite SQL where timetable columns (day_of_week, slot_id, etc.) are
-    incorrectly placed on the faculty table/alias.
-
-    Strategy:
-      1. Extract SELECT and WHERE columns.
-      2. Move timetable columns from faculty alias → ft alias.
-      3. Ensure FROM clause uses faculty_timetable ft as base.
-    """
-    # Move alias references: f.day_of_week → ft.day_of_week (etc.)
-    fixed = _FACULTY_TT_COL_PAT.sub(
-        lambda m: f"ft.{m.group(1).lower()}", sql
-    )
-
-    # Ensure faculty_timetable is in FROM clause
-    has_ft = bool(re.search(r'\bfaculty_timetable\b', fixed, re.IGNORECASE))
-    has_faculty_from = bool(re.search(
-        r'\bFROM\s+faculty\b|\bFROM\s+faculty\s+(?:AS\s+)?f\b', fixed, re.IGNORECASE
-    ))
-
-    if not has_ft and has_faculty_from:
-        # Replace "FROM faculty [AS] f" with proper timetable join
-        fixed = re.sub(
-            r'\bFROM\s+faculty\s+(?:AS\s+)?f?\b',
-            'FROM faculty_timetable ft JOIN faculty f ON ft.faculty_id = f.faculty_id',
-            fixed,
-            flags=re.IGNORECASE,
-        )
-        # Add time_slots join if hour_number is referenced
-        if 'ts.hour_number' in fixed and 'time_slots' not in fixed:
-            fixed = re.sub(
-                r'(JOIN faculty f ON ft\.faculty_id = f\.faculty_id)',
-                r'\1 JOIN time_slots ts ON ft.slot_id = ts.slot_id',
-                fixed,
-                flags=re.IGNORECASE,
-            )
-
-    return fixed.strip()
-
-
-def _build_alias_map(sql: str) -> dict[str, str]:
-    """
-    Parse FROM and JOIN clauses to build alias → table_name mapping.
-    e.g.  "FROM faculty f JOIN time_slots ts" → {"f": "faculty", "ts": "time_slots"}
-    """
-    alias_map: dict[str, str] = {}
-    for match in _FROM_ALIAS_PAT.finditer(sql):
-        table, alias = match.group(1).lower(), match.group(2).lower()
-        if table in SCHEMA:
-            alias_map[alias] = table
-            # Also map bare table name to itself
-            alias_map[table] = table
-    return alias_map
-
-
-def _check_alias_columns(sql: str, alias_map: dict[str, str]) -> list[str]:
-    """
-    For each alias.column reference in the SQL, check that the column
-    actually exists on the resolved table.
+    For each (alias, column) reference, check that the column actually
+    exists on the resolved table.
 
     Skips aliases not found in alias_map (subquery aliases, CTEs, etc.)
     """
     errors: list[str] = []
     seen: set[tuple] = set()
 
-    for match in _ALIAS_COL_PAT.finditer(sql):
-        alias = match.group(1).lower()
-        col   = match.group(2).lower()
-
+    for alias, col in column_refs:
+        if not alias:
+            continue
         if (alias, col) in seen:
             continue
         seen.add((alias, col))
@@ -549,12 +405,12 @@ def _check_alias_columns(sql: str, alias_map: dict[str, str]) -> list[str]:
             continue   # unknown alias — could be subquery/CTE, skip
 
         table = alias_map[alias]
-        if table not in SCHEMA:
+        if not table_exists(table):
             continue   # unknown table — skip
 
-        if col not in SCHEMA[table]:
+        if col not in get_columns(table):
             # Is it a timetable column on faculty?
-            if table == "faculty" and col in _TIMETABLE_ONLY_COLS:
+            if table == "faculty" and col in TIMETABLE_ONLY_COLS:
                 errors.append(
                     f"'{alias}.{col}' — column '{col}' belongs to "
                     f"faculty_timetable, NOT faculty."

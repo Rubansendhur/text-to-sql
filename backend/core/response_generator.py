@@ -26,6 +26,12 @@ OLLAMA_URL     = os.getenv("OLLAMA_URL",     "http://localhost:11434")
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "llama3.2")
 SQLCODER_MODEL = os.getenv("SQLCODER_MODEL", "sqlcoder")
 
+# When false, skip the prose-summary LLM call entirely and use the fast
+# deterministic templates below. This removes one LLM call (and, on a single
+# GPU, one resident model) from every query's hot path — the biggest latency
+# win when SQL generation and prose generation use different local models.
+USE_LLM_PROSE = os.getenv("USE_LLM_PROSE", "true").lower() == "true"
+
 # Provider mode switch must mirror SQL generation mode in rag_engine.py.
 LEGACY_PROVIDER = os.getenv("SQL_LLM_PROVIDER", "").strip().lower()
 MODE = os.getenv("MODE", "").strip().upper()
@@ -221,7 +227,7 @@ async def _llm_summarise(question: str, rows: list, row_count: int, columns: lis
                 log.info("[ResponseGen] LLM summary: %d chars", len(text))
                 return text
     except Exception as e:
-        log.warning("[ResponseGen] LLM summarise failed: %s", e)
+        log.warning("[ResponseGen] LLM summarise failed: %s: %s", type(e).__name__, e)
     return None
 
 
@@ -399,8 +405,10 @@ def _enforce_summary_count(summary: str, row_count: int, display_type: str) -> s
         return summary
 
     # Normalize common phrasing mismatches: "8 faculty members", "12 rows", etc.
+    # Tolerate markdown bold around the number (e.g. "**8** students") so an
+    # already-correct bolded count isn't treated as "no count" and doubled up.
     patt = re.compile(
-        r"\b(\d+)\s+"
+        r"\*{0,2}(\d+)\*{0,2}\s+"
         r"(faculty(?:\s+members?)?|students?|subjects?|rows?|records?|results?|entries?)\b",
         flags=re.IGNORECASE,
     )
@@ -412,7 +420,7 @@ def _enforce_summary_count(summary: str, row_count: int, display_type: str) -> s
         nonlocal found_any
         found_any = True
         noun = match.group(2)
-        return f"{row_count} {noun}"
+        return f"**{row_count}** {noun}"
 
     summary = patt.sub(_replace_count, summary)
     if found_any:
@@ -480,8 +488,10 @@ class ResponseGenerator:
         elif display_type == "timetable" and _is_free_period_question(question):
             summary = _build_free_period_summary(rows)
         else:
-            # LLM summary (best effort, async)
-            summary = await _llm_summarise(question, rows, row_count, columns)
+            # LLM summary (best effort, async) — unless disabled for latency.
+            summary = None
+            if USE_LLM_PROSE:
+                summary = await _llm_summarise(question, rows, row_count, columns)
             if not summary:
                 summary = _fallback_summary(question, rows, row_count, columns)
 

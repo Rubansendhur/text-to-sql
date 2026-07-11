@@ -6,6 +6,7 @@ Utility helpers used by routers/chat.py.
 import os
 import re
 from datetime import date
+from difflib import get_close_matches
 from fastapi import Request
 from core.rag_engine import get_rag_engine
 
@@ -38,127 +39,21 @@ def get_engine(request: Request):
     return getattr(request.app.state, "nl_engine", None) or get_legacy_engine()
 
 
-def inject_scope_predicate(sql: str, predicate: str) -> str:
-    """Inject predicate into main query before GROUP/ORDER/LIMIT/OFFSET at top-level only.
-    
-    Respects parentheses depth to avoid inserting inside window functions or subqueries.
-    Only matches keywords at depth 0 (outside all parentheses).
-    """
-    if not sql or not predicate:
-        return sql
-
-    # Scan for top-level (depth=0) clause keywords
-    depth = 0
-    in_string = False
-    string_char = None
-    first_clause_pos = None
-    
-    i = 0
-    while i < len(sql):
-        ch = sql[i]
-        
-        # Track quoted strings to avoid matching keywords inside them
-        if ch in ("'", '"') and (i == 0 or sql[i-1] != "\\"):
-            if not in_string:
-                in_string = True
-                string_char = ch
-            elif ch == string_char:
-                in_string = False
-                string_char = None
-        
-        if in_string:
-            i += 1
-            continue
-        
-        # Track parentheses depth (only outside strings)
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth = max(0, depth - 1)
-        
-        # At top level (depth 0), look for clause keywords
-        if depth == 0:
-            rest_upper = sql[i:i+10].upper()
-            for kw in ["GROUP BY", "ORDER BY", "LIMIT", "OFFSET"]:
-                if rest_upper.startswith(kw):
-                    # Verify word boundary
-                    before_ok = i == 0 or (sql[i-1] not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
-                    after_ok = i + len(kw) >= len(sql) or (sql[i+len(kw)] not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
-                    if before_ok and after_ok:
-                        first_clause_pos = i
-                        break
-            
-            if first_clause_pos is not None:
-                break
-        
-        i += 1
-    
-    # Split and build result
-    if first_clause_pos is not None:
-        body = sql[:first_clause_pos].rstrip()
-        tail = sql[first_clause_pos:]
-    else:
-        body = sql.rstrip()
-        tail = ""
-    
-    # Add WHERE or AND
-    if re.search(r"\bWHERE\b", body, flags=re.IGNORECASE):
-        body = f"{body} AND {predicate}"
-    else:
-        body = f"{body} WHERE {predicate}"
-    
-    return (f"{body} {tail}" if tail else body).strip()
+# NOTE: department-scope injection (formerly inject_scope_predicate /
+# force_department_scope, a hand-rolled paren-depth string scanner) has moved
+# to core.sql_corrections.apply_department_scope, which uses sqlglot AST
+# manipulation instead — see that module for details.
 
 
-def force_department_scope(sql: str, department_code: str) -> str:
-    """
-    Add deterministic department scope for common table aliases when model forgets it.
-    Uses EXISTS to avoid changing SELECT/GROUP BY columns.
-    """
-    if not sql or not department_code:
-        return sql
-
-    alias_map: dict[str, str] = {}
-    sql_keywords = {
-        "where", "join", "left", "right", "inner", "outer", "full",
-        "on", "group", "order", "limit", "offset", "having", "union",
-    }
-
-    for m in re.finditer(
-        r"\b(?:FROM|JOIN)\s+([a-zA-Z_][\w]*)(?:\s+(?:AS\s+)?([a-zA-Z_][\w]*))?\b",
-        sql,
-        flags=re.IGNORECASE,
-    ):
-        table = m.group(1).lower()
-        raw_alias = (m.group(2) or "").strip()
-        alias = raw_alias if raw_alias and raw_alias.lower() not in sql_keywords else table
-        alias_map[table] = alias
-
-    anchor_alias = (
-        alias_map.get("students")
-        or alias_map.get("faculty")
-        or alias_map.get("subjects")
-        or alias_map.get("class_timetable")
-        or alias_map.get("faculty_timetable")
-    )
-    if not anchor_alias:
-        return sql
-
-    predicate = (
-        "EXISTS ("
-        "SELECT 1 FROM departments d_scope "
-        f"WHERE d_scope.department_id = {anchor_alias}.department_id "
-        f"AND d_scope.department_code = '{department_code}'"
-        ")"
-    )
-    return inject_scope_predicate(sql, predicate)
-
-
-def normalize_sql(sql: str) -> str:
-    """Apply lightweight SQL normalization before execution."""
+def expand_fuzzy_name_matches(sql: str) -> str:
+    """Rewrite person-name comparisons (faculty.full_name / students.name) to
+    be resilient to minor spelling variations — repeated letters and vowel
+    drift (e.g., bhavatharaini vs bhavatharini). This is a search-quality
+    feature over string literal values, not a SQL-structure repair, so it
+    stays regex-based (there's no parse tree involved — it only rewrites
+    literal comparison expressions)."""
     if not sql:
         return sql
-    sql = re.sub(r"^\s*SELECT\s+SELECT\b", "SELECT", sql, flags=re.IGNORECASE).strip()
 
     alias_map: dict[str, str] = {}
     for m in re.finditer(
@@ -170,147 +65,6 @@ def normalize_sql(sql: str) -> str:
         alias = m.group(2)
         alias_map[alias] = table
 
-    # In this schema, day_of_week lives on faculty_timetable (ft), not time_slots (ts).
-    if re.search(r"\bfaculty_timetable\s+(?:AS\s+)?ft\b", sql, flags=re.IGNORECASE):
-        sql = re.sub(r"\bts\s*\.\s*day_of_week\b", "ft.day_of_week", sql, flags=re.IGNORECASE)
-
-    # current_semester is derived from admission_year, not a stored column.
-    semester_expr_template = (
-        "(EXTRACT(YEAR FROM CURRENT_DATE)::int - {alias}.admission_year) * 2 "
-        "+ CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE) >= 7 THEN 1 ELSE 0 END"
-    )
-    for alias, table in alias_map.items():
-        if table == "students":
-            sql = re.sub(
-                rf"\b{re.escape(alias)}\s*\.\s*current_semester\b",
-                semester_expr_template.format(alias=alias),
-                sql,
-                flags=re.IGNORECASE,
-            )
-
-    # LLM sometimes emits invalid `exam_year = current_semester` against
-    # student_subject_attempts where `current_semester` is not a real column.
-    # Repair to a valid year-based predicate as a safe fallback.
-    sql = re.sub(
-        r"\bexam_year\s*=\s*current_semester\b",
-        "exam_year = EXTRACT(YEAR FROM CURRENT_DATE)::int",
-        sql,
-        flags=re.IGNORECASE,
-    )
-    sql = re.sub(
-        r"\bcurrent_semester\s*=\s*exam_year\b",
-        "EXTRACT(YEAR FROM CURRENT_DATE)::int = exam_year",
-        sql,
-        flags=re.IGNORECASE,
-    )
-
-    # class_timetable uses id + hour_number, not tt_id/slot_id.
-    class_timetable_aliases = [alias for alias, table in alias_map.items() if table == "class_timetable"]
-    time_slots_aliases = [alias for alias, table in alias_map.items() if table == "time_slots"]
-    for ct_alias in class_timetable_aliases:
-        sql = re.sub(rf"\b{re.escape(ct_alias)}\s*\.\s*tt_id\b", f"{ct_alias}.id", sql, flags=re.IGNORECASE)
-        sql = re.sub(rf"\b{re.escape(ct_alias)}\s*\.\s*slot_id\b", f"{ct_alias}.hour_number", sql, flags=re.IGNORECASE)
-        for ts_alias in time_slots_aliases:
-            sql = re.sub(
-                rf"\b{re.escape(ts_alias)}\s*\.\s*slot_id\s*=\s*{re.escape(ct_alias)}\s*\.\s*slot_id\b",
-                f"{ts_alias}.hour_number = {ct_alias}.hour_number",
-                sql,
-                flags=re.IGNORECASE,
-            )
-            sql = re.sub(
-                rf"\b{re.escape(ct_alias)}\s*\.\s*slot_id\s*=\s*{re.escape(ts_alias)}\s*\.\s*slot_id\b",
-                f"{ct_alias}.hour_number = {ts_alias}.hour_number",
-                sql,
-                flags=re.IGNORECASE,
-            )
-
-    # If query references ts.* but time_slots is not joined, inject the LEFT JOIN.
-    # This catches LLM SQL that uses ts.hour_number/ts.start_time in SELECT/ORDER BY
-    # but forgets to include LEFT JOIN time_slots ts ON ft.slot_id = ts.slot_id.
-    if re.search(r"\bts\s*\.\s*\w+\b", sql, flags=re.IGNORECASE):
-        if not re.search(r"\btime_slots\b", sql, flags=re.IGNORECASE):
-            if re.search(r"\bfaculty_timetable\b", sql, flags=re.IGNORECASE):
-                # Inject after the faculty JOIN if present, else after faculty_timetable
-                injected = " LEFT JOIN time_slots ts ON ft.slot_id = ts.slot_id"
-                # Try to insert after "JOIN faculty f ON ft.faculty_id = f.faculty_id"
-                faculty_join_pat = re.compile(
-                    r"(JOIN\s+faculty\s+(?:AS\s+)?f\s+ON\s+ft\.faculty_id\s*=\s*f\.faculty_id)",
-                    re.IGNORECASE
-                )
-                if faculty_join_pat.search(sql):
-                    sql = faculty_join_pat.sub(r"\1" + injected, sql, count=1)
-                else:
-                    # Fallback: inject before WHERE
-                    where_match = re.search(r"\bWHERE\b", sql, re.IGNORECASE)
-                    if where_match:
-                        sql = sql[:where_match.start()] + injected + " " + sql[where_match.start():]
-
-    alias_map: dict[str, str] = {}
-    for m in re.finditer(
-        r"\b(?:FROM|JOIN)\s+([a-zA-Z_][\w]*)\s+(?:AS\s+)?([a-zA-Z_][\w]*)\b",
-        sql,
-        flags=re.IGNORECASE,
-    ):
-        table = m.group(1).lower()
-        alias = m.group(2)
-        alias_map[alias] = table
-
-    pk_map = {
-        "students": "student_id",
-        "faculty": "faculty_id",
-        "subjects": "subject_id",
-        "departments": "department_id",
-        "student_subject_attempts": "attempt_id",
-        "faculty_timetable": "tt_id",
-        "class_timetable": "id",
-        "time_slots": "slot_id",
-    }
-
-    def _count_fix(match: re.Match) -> str:
-        alias = match.group(1)
-        table = alias_map.get(alias)
-        if not table:
-            return match.group(0)
-        pk = pk_map.get(table)
-        if not pk:
-            return match.group(0)
-        return f"COUNT({alias}.{pk})"
-
-    sql = re.sub(r"COUNT\(\s*([a-zA-Z_][\w]*)\s*\.\s*id\s*\)", _count_fix, sql, flags=re.IGNORECASE)
-
-    # Free-faculty queries must use occupancy logic, not activity literal checks.
-    # Some generated SQL incorrectly assumes ft.activity='Free Period'.
-    if re.search(r"\bft\s*\.\s*activity\s*=\s*'\s*free\s*period\s*'", sql, flags=re.IGNORECASE):
-        day_match = re.search(r"\bft\s*\.\s*day_of_week\s*=\s*'([A-Za-z]{3})'", sql, flags=re.IGNORECASE)
-        hour_match = re.search(r"\bts\s*\.\s*hour_number\s*=\s*(\d{1,2})", sql, flags=re.IGNORECASE)
-        dept_match = re.search(r"\b[a-zA-Z_][\w]*\s*\.\s*department_code\s*=\s*'([^']+)'", sql, flags=re.IGNORECASE)
-
-        if day_match and hour_match:
-            day = day_match.group(1)
-            hour = int(hour_match.group(1))
-            dept = dept_match.group(1) if dept_match else None
-
-            where_parts = ["f.is_active = TRUE"]
-            if dept:
-                where_parts.insert(0, f"d.department_code = '{sql_quote(dept)}'")
-
-            sql = (
-                "SELECT f.full_name, f.designation "
-                "FROM faculty f "
-                "JOIN departments d ON f.department_id = d.department_id "
-                f"WHERE {' AND '.join(where_parts)} "
-                "AND f.faculty_id NOT IN ("
-                "SELECT ft.faculty_id "
-                "FROM faculty_timetable ft "
-                "JOIN time_slots ts ON ft.slot_id = ts.slot_id "
-                f"WHERE ft.day_of_week = '{day}' "
-                f"AND ts.hour_number = {hour}"
-                ") "
-                "ORDER BY f.full_name"
-            )
-
-    # Make person-name searches resilient to minor spelling variations.
-    # Handles repeated letters and vowel drift (e.g., bhavatharaini vs bhavatharini).
     def _name_expr(col_sql: str) -> str:
         return (
             "regexp_replace(" 
@@ -902,6 +656,21 @@ def build_faculty_timetable_sql(
     )
 
 
+_STAFF_VOCAB = ["faculty", "staff", "teacher", "teachers", "professor", "lecturer"]
+
+
+def _mentions_staff(q: str) -> bool:
+    """True if the question refers to staff/faculty, tolerant of common typos
+    (e.g. 'facutly', 'faclty', 'techer'). HOD users mistype 'faculty' often,
+    and without this a typo silently drops them onto the unreliable LLM path."""
+    if any(k in q for k in ("staff", "faculty", "teacher", "professor", "lecturer", "who")):
+        return True
+    for tok in re.findall(r"[a-z]{4,}", q):
+        if get_close_matches(tok, _STAFF_VOCAB, n=1, cutoff=0.8):
+            return True
+    return False
+
+
 def build_free_staff_sql(
     question: str,
     department_code: str | None,
@@ -911,20 +680,30 @@ def build_free_staff_sql(
     Deterministic SQL for queries like:
       - "Which staff are free on Monday 2nd hour?"
       - "Who is available on Tue 4th period?"
+      - "Which staff are free on Monday?" (day-only — lists every hour)
+      - "Who is free 2nd hour?" (hour-only — defaults day to today)
 
-    To avoid false positives, this shortcut only triggers when BOTH day and hour
-    are present in the question.
+    Requires day AND/OR hour to be present (at least one) plus a
+    free/available keyword and a staff mention. A question with neither day
+    nor hour is too ambiguous for a deterministic answer and falls through
+    to the LLM path (note: this does NOT parse clock times like "2pm" —
+    only ordinal hour/period mentions like "2nd hour").
     """
     q = (question or "").lower()
     is_free_query = any(k in q for k in ["free", "available", "not occupied"])
-    targets_staff = any(k in q for k in ["staff", "faculty", "teacher", "who"])
+    targets_staff = _mentions_staff(q)
     if not (is_free_query and targets_staff):
         return None
 
     day = normalize_day_token(question)
     hour = extract_hour_token(question)
-    if not day or hour is None:
+    if not day and hour is None:
         return None
+
+    # Hour given but no day mentioned — assume today, consistent with the
+    # relative-day handling elsewhere in this module.
+    if not day:
+        day = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][date.today().weekday()]
 
     # Institution policy: Sunday is a non-working day for timetable/free-staff lookups.
     if day == "Sun":
@@ -939,23 +718,44 @@ def build_free_staff_sql(
     if not is_central_admin and department_code:
         where_parts.append(f"d.department_code = '{sql_quote(department_code)}'")
 
+    if hour is not None:
+        return (
+            "SELECT "
+            "f.full_name, f.designation, "
+            f"'{day}'::text AS day_of_week, "
+            f"{hour}::int AS hour_number "
+            "FROM faculty f "
+            "JOIN departments d ON f.department_id = d.department_id "
+            f"WHERE {' AND '.join(where_parts)} "
+            "AND NOT EXISTS ("
+            "SELECT 1 "
+            "FROM faculty_timetable ft "
+            "JOIN time_slots ts ON ft.slot_id = ts.slot_id "
+            "WHERE ft.faculty_id = f.faculty_id "
+            f"AND ft.day_of_week = '{day}' "
+            f"AND ts.hour_number = {hour}"
+            ") "
+            "ORDER BY f.full_name"
+        )
+
+    # Day-only: list every hour that day the faculty member has no class.
     return (
         "SELECT "
         "f.full_name, f.designation, "
         f"'{day}'::text AS day_of_week, "
-        f"{hour}::int AS hour_number "
+        "ts.hour_number "
         "FROM faculty f "
         "JOIN departments d ON f.department_id = d.department_id "
+        "CROSS JOIN time_slots ts "
         f"WHERE {' AND '.join(where_parts)} "
         "AND NOT EXISTS ("
         "SELECT 1 "
         "FROM faculty_timetable ft "
-        "JOIN time_slots ts ON ft.slot_id = ts.slot_id "
         "WHERE ft.faculty_id = f.faculty_id "
         f"AND ft.day_of_week = '{day}' "
-        f"AND ts.hour_number = {hour}"
+        "AND ft.slot_id = ts.slot_id"
         ") "
-        "ORDER BY f.full_name"
+        "ORDER BY f.full_name, ts.hour_number"
     )
 
 

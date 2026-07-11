@@ -572,6 +572,17 @@ ORDER BY f.full_name;""",
         "tags": ["faculty", "list"],
     },
     {
+        "question": "List all faculty members and their designation",
+        "sql": """\
+SELECT f.full_name, f.designation
+FROM faculty f
+JOIN departments d ON f.department_id = d.department_id
+WHERE d.department_code = '{DEPT}'
+  AND f.is_active = TRUE
+ORDER BY f.full_name;""",
+        "tags": ["faculty", "list", "designation"],
+    },
+    {
         "question": "How many faculty members are there?",
         "sql": """\
 SELECT COUNT(*) AS total_faculty

@@ -8,20 +8,25 @@ if "core.rag_engine" not in sys.modules:
     rag_engine_stub.get_rag_engine = lambda: None
     sys.modules["core.rag_engine"] = rag_engine_stub
 
-from core.chat_helpers import normalize_sql
+from core.sql_corrections import apply_schema_corrections
 
 
-class NormalizeSqlRegressionTests(unittest.TestCase):
+class SchemaCorrectionsRegressionTests(unittest.TestCase):
+    """Regression coverage for rules formerly implemented via regex in
+    chat_helpers.normalize_sql, now implemented as AST rewrites in
+    core.sql_corrections (see core/sql_ast.py)."""
+
     def test_rewrites_exam_year_equals_current_semester(self):
         raw_sql = (
             "SELECT student_id FROM student_subject_attempts "
             "WHERE exam_year = current_semester AND grade IN ('U','AB')"
         )
 
-        normalized = normalize_sql(raw_sql)
+        outcome = apply_schema_corrections(raw_sql)
 
-        self.assertNotIn("exam_year = current_semester", normalized.lower())
-        self.assertIn("exam_year = EXTRACT(YEAR FROM CURRENT_DATE)::int", normalized)
+        self.assertIn("exam_year_eq_current_semester", outcome.applied_rules)
+        self.assertNotIn("exam_year = current_semester", outcome.sql.lower())
+        self.assertIn("EXTRACT(YEAR FROM CURRENT_DATE)", outcome.sql)
 
     def test_rewrites_current_semester_equals_exam_year(self):
         raw_sql = (
@@ -29,10 +34,11 @@ class NormalizeSqlRegressionTests(unittest.TestCase):
             "WHERE current_semester = exam_year"
         )
 
-        normalized = normalize_sql(raw_sql)
+        outcome = apply_schema_corrections(raw_sql)
 
-        self.assertNotIn("current_semester = exam_year", normalized.lower())
-        self.assertIn("EXTRACT(YEAR FROM CURRENT_DATE)::int = exam_year", normalized)
+        self.assertIn("current_semester_eq_exam_year", outcome.applied_rules)
+        self.assertNotIn("current_semester = exam_year", outcome.sql.lower())
+        self.assertIn("EXTRACT(YEAR FROM CURRENT_DATE)", outcome.sql)
 
 
 if __name__ == "__main__":
